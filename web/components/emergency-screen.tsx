@@ -5,7 +5,11 @@ import { Button } from "@/components/ui/button"
 import { CircleAlert, Phone, ShieldAlert, MapPin } from "lucide-react"
 
 export function EmergencyScreen() {
-  const { emergencyTimer, acknowledgeFall } = useFallDetection()
+  const { emergencyTimer, acknowledgeFall, gpsLat, gpsLon } = useFallDetection()
+  const hasGPS = gpsLat !== 0 || gpsLon !== 0
+  const locationLabel = hasGPS
+    ? `${gpsLat.toFixed(5)}, ${gpsLon.toFixed(5)}`
+    : "GPS searching..."
 
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60)
@@ -52,7 +56,7 @@ export function EmergencyScreen() {
           {/* Location */}
           <div className="flex items-center gap-2 text-card/50">
             <MapPin className="size-3.5" />
-            <span className="text-xs font-medium">Home - Living Room</span>
+            <span className="text-xs font-medium">{locationLabel}</span>
           </div>
 
           {/* Actions */}
@@ -65,14 +69,16 @@ export function EmergencyScreen() {
               <CircleAlert className="mr-2 size-5" />
               I'm Okay - Acknowledge
             </Button>
-            <Button
-              size="lg"
-              variant="outline"
-              className="h-14 rounded-2xl border-2 border-card/20 bg-card/5 text-card text-base font-semibold hover:bg-card/10 hover:text-card backdrop-blur-sm transition-all duration-300"
-            >
-              <Phone className="mr-2 size-5" />
-              Call Emergency
-            </Button>
+            <a href="tel:0816966694" className="w-full">
+              <Button
+                size="lg"
+                variant="outline"
+                className="h-14 w-full rounded-2xl border-2 border-card/20 bg-card/5 text-card text-base font-semibold hover:bg-card/10 hover:text-card backdrop-blur-sm transition-all duration-300"
+              >
+                <Phone className="mr-2 size-5" />
+                โทร 1669 (EMS)
+              </Button>
+            </a>
           </div>
         </div>
       </div>

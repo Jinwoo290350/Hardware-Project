@@ -1,0 +1,2 @@
+placement,dataset,n_windows,n_features,test_f1,precision,recall,auc,best_model
+SHIRT,FallAllD-Waist,30708,23,0.8485071876151862,0.8419897585954645,0.8551263001485884,0.9756876241593105,WeightedEnsemble_L2

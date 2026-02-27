@@ -1,0 +1,46 @@
+# =============================================
+# Hardware Project — .gitignore
+# =============================================
+
+# ── Arduino credentials (ห้าม commit!) ───────
+Full_System_README/config.h
+Caregiver_Side/config.h
+
+# ── Web credentials ───────────────────────────
+web/.env.local
+web/.env*.local
+
+# ── Next.js build ────────────────────────────
+web/.next/
+web/out/
+web/node_modules/
+
+# ── Python / ML ──────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# ML models (large — อย่า commit ขึ้น Git)
+ML/data/
+ML/models/CHEST_autogluon/
+ML/models/SHIRT_autogluon/
+ML/models/PANTS_autogluon/
+
+# ML model headers (generate จาก ESP32_export.ipynb)
+Full_System_README/CHEST_model.h
+Full_System_README/SHIRT_model.h
+Full_System_README/PANTS_model.h
+
+# ── macOS ─────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ── VS Code ───────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+
+# ── Logs ─────────────────────────────────────
+*.log
+npm-debug.log*

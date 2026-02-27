@@ -59,7 +59,7 @@ export function CaregiverResponse() {
                 iconBg: "bg-success/10",
                 iconColor: "text-success",
                 title: "Caregiver notified",
-                subtitle: "Dr. Sarah Chen - Primary",
+                subtitle: "Alert sent via Blynk",
                 delay: "delay-100",
               },
               {
@@ -67,8 +67,8 @@ export function CaregiverResponse() {
                 icon: MapPin,
                 iconBg: "bg-primary/10",
                 iconColor: "text-primary",
-                title: "ETA: 8 minutes",
-                subtitle: "Location shared with responder",
+                title: "GPS location shared",
+                subtitle: "Location sent to caregiver device",
                 delay: "delay-200",
               },
             ].map(({ visible, icon: Icon, iconBg, iconColor, title, subtitle }, i) => (

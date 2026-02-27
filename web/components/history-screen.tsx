@@ -55,7 +55,7 @@ export function HistoryScreen() {
         <div className="flex flex-col gap-1.5">
           <p className="text-base font-semibold text-foreground">No events recorded</p>
           <p className="text-sm text-muted-foreground leading-relaxed">
-            Use the Simulation panel to generate events
+            Events from the device will appear here
           </p>
         </div>
       </div>
