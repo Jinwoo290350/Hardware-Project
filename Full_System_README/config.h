@@ -13,8 +13,18 @@
 #define BLYNK_AUTH_TOKEN    "3vx4baXQOJYI8nFrQt9ya3CaeghTU5KV"
 
 // ── WiFi ─────────────────────────────────────────────────────
-#define WIFI_SSID  "KUWIN-IOT"
-#define WIFI_PASS  ""           // open network — ไม่มีรหัสผ่าน
+// เปลี่ยนเป็น hotspot มือถือ: ใส่ชื่อ WiFi และรหัสผ่านด้านล่าง
+#define WIFI_SSID  "Frank"
+#define WIFI_PASS  "frank285"
+
+// ── Device placement mode ─────────────────────────────────────
+// (ต้องอยู่ใน config.h เพื่อให้ compiler เห็น enum ก่อน auto-generated prototypes)
+enum Mode { CHEST = 0, SHIRT = 1, PANTS = 2 };
+
+// ── Debug: ปิด fall detection อัตโนมัติ (ใช้เฉพาะทดสอบ) ────────────
+// Uncomment บรรทัดด้านล่างเพื่อปิด threshold + ML fall detection
+// (BTN_EMERGENCY ยังทำงานได้ปกติ)
+// #define DISABLE_AUTO_FALL
 
 // ── MQTT (สำรอง — ไม่ได้ใช้ใน Blynk mode) ────────────────────
 // #define MQTT_BROKER "iot.cpe.ku.ac.th"

@@ -6,12 +6,12 @@
  *
  * Hardware:
  *   ESP32-S3
- *   MPU6050  (I2C: SDA=8, SCL=9)   shared bus with OLED
- *   OLED SSD1306 128x64 (I2C 0x3C, SDA=8, SCL=9)
+ *   MPU6050  (I2C: SDA=10, SCL=11)  ← shared bus with OLED
+ *   OLED SSD1306 128×64 (I2C 0x3C, SDA=10, SCL=11)
  *   GPS Module (UART RX=16, read-only)
  *   LED Green=4  Yellow=5  Red=6
  *   Buzzer GPIO 7
- *   BTN_MODE=10  BTN_EMERGENCY=14
+ *   BTN_MODE=9  BTN_EMERGENCY=12
  *
  * Libraries (Arduino Library Manager):
  *   - Blynk  by Volodymyr Shymanskyy
@@ -44,7 +44,6 @@
 
 #include <Wire.h>
 #include <WiFi.h>
-#include "driver/gpio.h"   // ESP-IDF native GPIO API (ใช้ใน silenceBuzzer)
 #include <BlynkSimpleEsp32.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -59,14 +58,6 @@
 #include "SHIRT_model.h"
 #include "PANTS_model.h"
 
-// Bring model classes into global scope (they live in Eloquent::ML::Port namespace)
-using namespace Eloquent::ML::Port;
-
-// Model instances (predict() is an instance method, not static)
-FallDetectorChest chestModel;
-FallDetectorShirt shirtModel;
-FallDetectorPants pantsModel;
-
 // WiFi credentials มาจาก config.h (WIFI_SSID / WIFI_PASS)
 
 // ===== PIN DEFINITIONS =====
@@ -74,15 +65,15 @@ FallDetectorPants pantsModel;
 #define LED_YELLOW     5    // LED เหลือง
 #define LED_RED        6    // LED แดง
 
-#define BTN_MODE       10   // ปุ่มสลับ mode (GPIO10 — ย้ายจาก GPIO3 ซึ่งเป็น UART0_RX)
-#define BTN_EMERGENCY  14   // ปุ่ม SOS (GPIO14 — ย้ายจาก GPIO46 ซึ่งเป็น strapping/pull-down)
+#define BTN_MODE       9    // ปุ่มสลับ mode
+#define BTN_EMERGENCY     // ปุ่ม SOS ฉุกเฉิน
 
 #define BUZZER         7    // Buzzer
 
-#define OLED_SDA        8   // I2C SDA (shared bus: OLED 0x3C + MPU6050 0x68)
-#define OLED_SCL        9   // I2C SCL (GPIO9 = SCL only — ห้ามใช้เป็น GPIO อื่น)
+#define OLED_SDA       10   // I2C SDA (shared: OLED 0x3C + MPU6050 0x68)
+#define OLED_SCL       11   // I2C SCL (shared: OLED 0x3C + MPU6050 0x68)
 
-// MPU6050: SDA→GPIO8, SCL→GPIO9, VCC→3.3V, GND→GND, AD0→GND
+// MPU6050: SDA→GPIO10, SCL→GPIO11, VCC→3.3V, GND→GND, AD0→GND
 // (AD0→GND → I2C address = 0x68, ไม่ชนกับ OLED 0x3C)
 
 #define GPS_RX         16   // ESP32 RX ← GPS module TX  (รับ NMEA จาก GPS)
@@ -93,44 +84,9 @@ FallDetectorPants pantsModel;
 #define SCREEN_HEIGHT  64
 #define OLED_RESET     -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-bool oledOK = false;  // set true only when OLED is confirmed on I2C bus
 
 // ===== MPU6050 =====
 Adafruit_MPU6050 mpu;
-bool    mpuUseRaw = false;   // true when WHO_AM_I=0x70 clone (Adafruit rejects it)
-uint8_t mpuI2CAddr = 0x68;  // actual I2C address found during setup (0x68 or 0x69)
-float   mpuAccelScale = 4096.0f; // LSB/g — set in setup() by reading ACCEL_CONFIG back
-
-// Raw MPU6050 read — works for 0x70 clones without Adafruit library
-// Scale is auto-detected from ACCEL_CONFIG readback in setup()
-// ±500°/s gyro (65.5 LSB/°/s)
-void mpuGetRaw(sensors_event_t *a, sensors_event_t *g, sensors_event_t *t) {
-  Wire.beginTransmission(mpuI2CAddr);
-  Wire.write(0x3B);  // ACCEL_XOUT_H
-  Wire.endTransmission(true);
-  Wire.requestFrom(mpuI2CAddr, (uint8_t)14);
-  if (Wire.available() < 14) return;
-  int16_t rax = (Wire.read()<<8)|Wire.read();
-  int16_t ray = (Wire.read()<<8)|Wire.read();
-  int16_t raz = (Wire.read()<<8)|Wire.read();
-  int16_t rt  = (Wire.read()<<8)|Wire.read();
-  int16_t rgx = (Wire.read()<<8)|Wire.read();
-  int16_t rgy = (Wire.read()<<8)|Wire.read();
-  int16_t rgz = (Wire.read()<<8)|Wire.read();
-  a->acceleration.x = rax * (9.80665f / mpuAccelScale);
-  a->acceleration.y = ray * (9.80665f / mpuAccelScale);
-  a->acceleration.z = raz * (9.80665f / mpuAccelScale);
-  g->gyro.x = rgx * (M_PI / (180.0f * 65.5f));
-  g->gyro.y = rgy * (M_PI / (180.0f * 65.5f));
-  g->gyro.z = rgz * (M_PI / (180.0f * 65.5f));
-  t->temperature = rt / 340.0f + 36.53f;
-}
-
-// Drop-in replacement for mpu.getEvent()
-void getMPUEvent(sensors_event_t *a, sensors_event_t *g, sensors_event_t *t) {
-  if (mpuUseRaw) mpuGetRaw(a, g, t);
-  else mpu.getEvent(a, g, t);
-}
 
 // ===== GPS =====
 TinyGPS gps;
@@ -142,7 +98,7 @@ float gpsLat = 0.0f, gpsLon = 0.0f;
 #define EEPROM_MODE_ADDR 0
 
 // ===== MODE =====
-// enum Mode defined in config.h (ต้องอยู่ก่อน auto-generated prototypes)
+enum Mode { CHEST = 0, SHIRT = 1, PANTS = 2 };
 Mode currentMode = CHEST;
 
 // ===== FALL DETECTION STATE MACHINE =====
@@ -156,12 +112,10 @@ enum FallState {
 FallState fallState = FALL_IDLE;
 
 // Fall detection thresholds (หน่วย m/s²)
-const float FREEFALL_THRESHOLD  = 3.0f;   // ต่ำกว่านี้ = กำลังตกอิสระ  (0.3g)
-const float IMPACT_THRESHOLD    = 14.7f;  // สูงกว่านี้ = กระแทกพื้น (1.5g) — ±2g sensor max ~19.6
-const float STILL_MAG_MIN       = 6.5f;   // หลังล้ม: acc_mag ≥ นี้ = ยังมีแรงโน้มถ่วง (ไม่ใช่ตก)
-const float STILL_MAG_MAX       = 13.0f;  // หลังล้ม: acc_mag ≤ นี้ = ยังนิ่ง ไม่ลุก
-const unsigned long FREEFALL_MIN_MS = 120; // freefall ต้องนานอย่างน้อย 120ms (กรอง vibration)
-const unsigned long VERIFY_WINDOW   = 3000; // ms — รอยืนยัน 3 วิหลัง impact
+const float FREEFALL_THRESHOLD  = 3.0f;   // ต่ำกว่านี้ = กำลังตกอิสระ
+const float IMPACT_THRESHOLD    = 20.0f;  // สูงกว่านี้ = กระแทกพื้น
+const float LYING_THRESHOLD     = 5.0f;   // az ต่ำกว่านี้ = นอนราบ
+const unsigned long VERIFY_WINDOW = 3000; // ms — รอยืนยัน 3 วิ
 
 // ===== ML BUFFER (50 Hz sliding window) =====
 #define ML_WIN   100     // 100 samples = 2 s @ 50 Hz  (CHEST/SHIRT)
@@ -172,7 +126,6 @@ const unsigned long VERIFY_WINDOW   = 3000; // ms — รอยืนยัน 3
 static float ml_ax[ML_WIN], ml_ay[ML_WIN], ml_az[ML_WIN];
 static int   ml_idx            = 0;   // circular buffer write position
 static int   ml_samples_new    = 0;   // samples collected since last inference
-static int   ml_total_samples  = 0;   // total ever collected (guard for startup)
 static float ml_features[26];         // output of extract_features_ml()
 static bool  ml_fall_flag      = false; // set true when ML predicts FALL
 
@@ -192,11 +145,8 @@ unsigned long lastBlynkSync    = 0;
 unsigned long lastButtonPress  = 0;
 unsigned long buzzer5sStart    = 0;
 unsigned long emergencyStart   = 0;
-unsigned long lastOLEDTimer    = 0;   // OLED emergency timer (global to reset properly)
 
 const unsigned long DEBOUNCE_MS    = 300;
-const unsigned long BTN_GUARD_MS   = 2000; // ignore BTN_EMERGENCY for 2s after loop() starts
-unsigned long       loopStartTime  = 0;    // set in first loop() iteration
 const unsigned long MPU_INTERVAL   = 200;  // 5 Hz  (threshold SM)
 const unsigned long ML_INTERVAL    =  20;  // 50 Hz (ML buffer fill)
 const unsigned long GPS_INTERVAL   = 2000;
@@ -222,180 +172,63 @@ void setup() {
   pinMode(BTN_EMERGENCY, INPUT_PULLUP);
   allLEDOff();
   digitalWrite(BUZZER, LOW);
-  Serial.println(F("[OK] GPIO configured"));
-
-  // ── DIAGNOSTIC: print button states immediately after pinMode ──────
-  delay(50);  // let internal pull-ups settle
-  Serial.print(F("[DIAG] BTN_MODE  (GPIO10) = "));
-  Serial.println(digitalRead(BTN_MODE)      == HIGH ? F("HIGH (ok)") : F("LOW !! check wiring/short"));
-  Serial.print(F("[DIAG] BTN_EMERG (GPIO14) = "));
-  Serial.println(digitalRead(BTN_EMERGENCY) == HIGH ? F("HIGH (ok)") : F("LOW !! check wiring/short"));
+  Serial.println(F("✓ GPIO configured"));
 
   // EEPROM — โหลด mode ที่บันทึกไว้
   EEPROM.begin(EEPROM_SIZE);
   uint8_t saved = EEPROM.read(EEPROM_MODE_ADDR);
   currentMode = (saved <= 2) ? (Mode)saved : CHEST;
-  Serial.print(F("[OK] EEPROM mode loaded: "));
+  Serial.print(F("✓ EEPROM mode loaded: "));
   printMode(currentMode); Serial.println();
 
-  // OLED — SSD1306 is write-only, use Adafruit begin() for init
-  // 10kHz I2C clock for reliable operation on breadboard wires
+  // OLED
   Wire.begin(OLED_SDA, OLED_SCL);
-  Wire.setClock(10000);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("[FAIL] OLED"));
+    Serial.println(F("✗ OLED FAILED — check SDA:10 SCL:11"));
   } else {
-    oledOK = true;
-    Serial.println(F("[OK] OLED initialized"));
+    Serial.println(F("✓ OLED initialized"));
     showBoot(F("BOOTING..."));
   }
 
-  // MPU6050 — reset I2C bus after OLED init, then reinit at 10kHz
-  Wire.end();
-  delay(50);
-  Wire.begin(OLED_SDA, OLED_SCL);
-  Wire.setClock(10000);
-  delay(50);
-
-  // WHO_AM_I check — try 0x68 (AD0=GND) then 0x69 (AD0=VCC/float)
-  uint8_t mpuAddr = 0x68;
-  uint8_t whoami  = 0xFF;
-  for (uint8_t addr : {0x68, 0x69}) {
-    Wire.beginTransmission(addr);
-    Wire.write(0x75);
-    Wire.endTransmission(true);
-    delay(5);
-    Wire.requestFrom(addr, (uint8_t)1);
-    uint8_t w = Wire.available() ? Wire.read() : 0xFF;
-    if (w != 0xFF) { whoami = w; mpuAddr = addr; break; }
-  }
-  mpuI2CAddr = mpuAddr;  // save to global for mpuGetRaw()
-  Serial.print(F("[..] MPU6050 WHO_AM_I = 0x")); Serial.print(whoami, HEX);
-  Serial.print(F(" @ 0x")); Serial.println(mpuAddr, HEX);
-
-  bool mpuOK = false;
-  if (whoami == 0x68 || whoami == 0x69) {
-    // genuine MPU6050 — use Adafruit library normally
-    mpuOK = mpu.begin(mpuAddr);
-    Wire.setClock(10000);
-  } else if (whoami == 0x70) {
-    // clone MPU6050 (WHO_AM_I=0x70) — bypass Adafruit, init manually
-    mpuUseRaw = true;
-    Wire.beginTransmission(mpuAddr);
-    Wire.write(0x6B); Wire.write(0x00);  // PWR_MGMT_1: wake up
-    Wire.endTransmission(true); delay(100);
-    Wire.beginTransmission(mpuAddr);
-    Wire.write(0x1C); Wire.write(0x10);  // ACCEL_CONFIG: try ±8g
-    Wire.endTransmission(true); delay(5);
-    Wire.beginTransmission(mpuAddr);
-    Wire.write(0x1B); Wire.write(0x08);  // GYRO_CONFIG: ±500°/s
-    Wire.endTransmission(true);
-    Wire.beginTransmission(mpuAddr);
-    Wire.write(0x1A); Wire.write(0x04);  // CONFIG: DLPF ~21Hz
-    Wire.endTransmission(true);
-
-    // ── อ่าน ACCEL_CONFIG กลับเพื่อ auto-detect scale จริง ──
-    Wire.beginTransmission(mpuAddr);
-    Wire.write(0x1C);
-    Wire.endTransmission(true);
-    Wire.requestFrom(mpuAddr, (uint8_t)1);
-    uint8_t acfg = Wire.available() ? Wire.read() : 0x10;
-    uint8_t afs  = (acfg >> 3) & 0x03;  // bits 4:3
-    // AFS_SEL: 0=±2g(16384), 1=±4g(8192), 2=±8g(4096), 3=±16g(2048)
-    const float lsbTable[4] = {16384.0f, 8192.0f, 4096.0f, 2048.0f};
-    mpuAccelScale = lsbTable[afs];
-    Serial.print(F("[OK] MPU6050 clone (0x70) @ 0x")); Serial.println(mpuAddr, HEX);
-    Serial.print(F("[OK] ACCEL_CONFIG=0x")); Serial.print(acfg, HEX);
-    Serial.print(F(" AFS_SEL=")); Serial.print(afs);
-    Serial.print(F(" scale=")); Serial.print(mpuAccelScale, 0);
-    Serial.println(F(" LSB/g"));
-    mpuOK = true;
-  }
-  if (!mpuOK) {
-    Serial.println(F("[FAIL] MPU6050 - check wiring: VCC=3.3V GND SDA=8 SCL=9"));
-    showBoot(F("MPU6050\nFAILED!\nCheck wires"));
+  // MPU6050 — แชร์ I2C bus กับ OLED (address 0x68)
+  if (!mpu.begin()) {
+    Serial.println(F("✗ MPU6050 FAILED — check SDA:10 SCL:11, AD0→GND"));
+    showBoot(F("MPU6050\nFAILED!"));
     while (1) delay(100);
   }
-  if (!mpuUseRaw) {
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  }
-  Serial.println(F("[OK] MPU6050 initialized (range: +-8g)"));
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println(F("✓ MPU6050 initialized (range: ±8g)"));
 
-  // Self-calibrating scale: sample raw mag during 10s still period
-  // (ไม่พึ่ง ACCEL_CONFIG register เพราะ clone บางตัวโกหก)
-  Serial.println(F("[..] Calibrating MPU6050 (10s) - keep STILL..."));
+  // Calibration 10 วิ — วางอุปกรณ์นิ่งๆ
+  Serial.println(F("⏳ Calibrating MPU6050 (10s) — keep device STILL..."));
   showBoot(F("CALIBRATING\n  10 sec\n  keep still"));
-  {
-    float rawMagSum = 0; int rawMagCount = 0;
-    for (int i = 0; i < 200; i++) {
-      Wire.beginTransmission(mpuI2CAddr);
-      Wire.write(0x3B);  // ACCEL_XOUT_H
-      Wire.endTransmission(true);
-      Wire.requestFrom(mpuI2CAddr, (uint8_t)6);
-      if (Wire.available() >= 6) {
-        int16_t rx = ((int16_t)Wire.read() << 8) | Wire.read();
-        int16_t ry = ((int16_t)Wire.read() << 8) | Wire.read();
-        int16_t rz = ((int16_t)Wire.read() << 8) | Wire.read();
-        rawMagSum += sqrt((float)rx*rx + (float)ry*ry + (float)rz*rz);
-        rawMagCount++;
-      }
-      delay(50);  // 200 × 50ms = 10s total
-    }
-    if (rawMagCount > 10) {
-      float measured = rawMagSum / rawMagCount;
-      // measured raw units correspond to 1g; 9.80665 m/s² = 1g
-      // store LSB/g so mpuGetRaw() divides raw/mpuAccelScale*9.80665 correctly
-      mpuAccelScale = measured;
-      Serial.print(F("[OK] Scale auto-calibrated: "));
-      Serial.print(mpuAccelScale, 1);
-      Serial.println(F(" LSB/g (raw counts per g)"));
-    } else {
-      Serial.println(F("[WARN] Calibration failed - using default 16384"));
-    }
-  }
-  Serial.println(F("[OK] Calibration complete"));
+  delay(10000);
+  Serial.println(F("✓ Calibration complete"));
 
   // GPS
   GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-  Serial.println(F("[OK] GPS initialized (RX=16)"));
+  Serial.println(F("✓ GPS initialized (RX=GPIO16, read-only)"));
 
-  // WiFi + Blynk (non-blocking — 10s timeout, ระบบทำงานได้แม้ไม่มี WiFi)
-  Serial.print(F("[..] WiFi connecting: ")); Serial.println(WIFI_SSID);
-  showBoot(F("Connecting\nWiFi..."));
-  WiFi.begin(WIFI_SSID, WIFI_PASS[0] ? WIFI_PASS : nullptr);
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
-    delay(500);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(F("[OK] WiFi connected"));
-    showBoot(F("WiFi OK\nBlynk..."));
-    Blynk.config(BLYNK_AUTH_TOKEN);
-    Blynk.connect(10000);  // 10s — network บน campus อาจช้า
-    if (Blynk.connected()) {
-      Serial.println(F("[OK] Blynk connected"));
-      Blynk.virtualWrite(V0, 0);
-      Blynk.virtualWrite(V3, (int)currentMode);
-      Blynk.virtualWrite(V4, 0);
-    } else {
-      Serial.println(F("[WARN] Blynk timeout - offline"));
-    }
-  } else {
-    Serial.println(F("[WARN] WiFi timeout - offline"));
-    showBoot(F("WiFi FAILED\nOffline mode"));
-    delay(1000);
-  }
+  // WiFi + Blynk
+  Serial.print(F("⏳ WiFi connecting: ")); Serial.println(WIFI_SSID);
+  showBoot(F("Connecting\nWiFi+Blynk..."));
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS[0] ? WIFI_PASS : nullptr);
+  Serial.println(F("✓ Blynk connected"));
+
+  // Initial Blynk state
+  Blynk.virtualWrite(V0, 0);
+  Blynk.virtualWrite(V3, (int)currentMode);
+  Blynk.virtualWrite(V4, 0);
 
   // Initial LED + OLED
   setLED(currentMode);
   displayMode(currentMode);
 
   // Welcome beep
-  tone(BUZZER, 3000, 80); delay(110);
-  tone(BUZZER, 4000, 80); delay(110);
-  silenceBuzzer();  // Force pin กลับมาอยู่ใต้ GPIO control หลัง LEDC
+  tone(BUZZER, 2000, 80); delay(110); noTone(BUZZER);
+  tone(BUZZER, 2500, 80); delay(110); noTone(BUZZER);
 
   Serial.println(F("\n=== SYSTEM READY — MONITORING ==="));
 }
@@ -404,12 +237,8 @@ void setup() {
 //  MAIN LOOP
 // ============================================================
 void loop() {
-  // Record the moment loop() first runs (guard is relative to this, not power-on)
-  if (loopStartTime == 0) loopStartTime = millis();
+  Blynk.run();
 
-  if (Blynk.connected()) Blynk.run();
-
-#ifndef DISABLE_AUTO_FALL
   // ── ML buffer fill @ 50Hz (ทำงานเสมอ รวมถึงระหว่าง emergency ด้วย) ──
   if (millis() - lastMLSample >= ML_INTERVAL) {
     lastMLSample = millis();
@@ -421,7 +250,6 @@ void loop() {
     lastMPURead = millis();
     processMPU();
   }
-#endif  // DISABLE_AUTO_FALL
 
   // ── GPS ────────────────────────────────────────────────────
   while (GPSSerial.available()) gps.encode(GPSSerial.read());
@@ -433,15 +261,10 @@ void loop() {
   // ── Blynk heartbeat sync ───────────────────────────────────
   if (millis() - lastBlynkSync >= BLYNK_INTERVAL) {
     lastBlynkSync = millis();
-    if (Blynk.connected()) {
-      Blynk.virtualWrite(V0, emergencyActive ? 2 : 0);
-      Blynk.virtualWrite(V1, gpsLat);
-      Blynk.virtualWrite(V2, gpsLon);
-      Blynk.virtualWrite(V3, (int)currentMode);
-    }
-    Serial.print(F("[OK] sync emergency="));
-    Serial.print(emergencyActive);
-    Serial.println(Blynk.connected() ? F(" [Blynk OK]") : F(" [offline]"));
+    Blynk.virtualWrite(V0, emergencyActive ? 2 : 0);
+    Blynk.virtualWrite(V1, gpsLat);
+    Blynk.virtualWrite(V2, gpsLon);
+    Blynk.virtualWrite(V3, (int)currentMode);
   }
 
   // ── Buzzer 5 วิ (เมื่อเริ่ม emergency) ─────────────────────
@@ -450,11 +273,11 @@ void loop() {
     if (millis() - buzzer5sStart < 5000) {
       if (millis() - lastBeep > 300) {
         lastBeep = millis();
-        tone(BUZZER, 3800, 150);
+        tone(BUZZER, 2500, 150);
       }
     } else {
       buzzer5sActive = false;
-      silenceBuzzer();
+      noTone(BUZZER);
     }
   }
 
@@ -465,75 +288,45 @@ void loop() {
     if (millis() - lastBuzz > 200) {
       lastBuzz = millis();
       buzzState = !buzzState;
-      if (buzzState) { tone(BUZZER, 4000, 150); digitalWrite(LED_RED, HIGH); }
-      else           { silenceBuzzer(); digitalWrite(LED_RED, LOW); }
+      if (buzzState) { tone(BUZZER, 2800, 150); digitalWrite(LED_RED, HIGH); }
+      else           { noTone(BUZZER);           digitalWrite(LED_RED, LOW);  }
     }
   }
 
   // ── Emergency timer บน OLED ────────────────────────────────
   if (emergencyActive) {
-    if (millis() - lastOLEDTimer >= 1000) {
-      lastOLEDTimer = millis();
+    static unsigned long lastOLED = 0;
+    if (millis() - lastOLED >= 1000) {
+      lastOLED = millis();
       displayEmergencyTimer();
     }
   }
 
   // ── ปุ่ม MODE ─────────────────────────────────────────────
-  // ขณะ emergency: กด BTN_MODE เพื่อ clear emergency
-  // ขณะปกติ: กด BTN_MODE เพื่อเปลี่ยน mode
-  // ── ปุ่ม MODE (GPIO 3) ────────────────────────────────────
-  {
-    static bool modeWasLow = false;
-    bool modeLow = (digitalRead(BTN_MODE) == LOW);
-    if (modeLow && !modeWasLow) {
-      // falling edge — แสดง raw state ทันที (ก่อน debounce)
-      Serial.print(F("[BTN] MODE pressed (GPIO3) t="));
-      Serial.println(millis());
-    }
-    modeWasLow = modeLow;
-
-    if (modeLow && millis() - lastButtonPress > DEBOUNCE_MS) {
+  if (digitalRead(BTN_MODE) == LOW && !modeLocked) {
+    if (millis() - lastButtonPress > DEBOUNCE_MS) {
       lastButtonPress = millis();
-      if (emergencyActive) {
-        Serial.println(F("[BTN] MODE -> clear emergency"));
-        clearEmergency();
-        return;
-      }
-      if (modeLocked) {
-        Serial.println(F("[BTN] MODE ignored (modeLocked)"));
-        return;
-      }
       currentMode = (Mode)((currentMode + 1) % 3);
       saveMode(currentMode);
-      if (Blynk.connected()) Blynk.virtualWrite(V3, (int)currentMode);
-      tone(BUZZER, 3200, 80); delay(100); silenceBuzzer();
+      Blynk.virtualWrite(V3, (int)currentMode);
+      tone(BUZZER, 2200, 80); delay(100); noTone(BUZZER);
       setLED(currentMode);
       displayMode(currentMode);
-      Serial.print(F("> Mode: ")); printMode(currentMode); Serial.println();
+      Serial.print(F("→ Mode: ")); printMode(currentMode); Serial.println();
     }
   }
 
-  // ── ปุ่ม EMERGENCY (GPIO 14) ─────────────────────────────
-  {
-    static bool sosWasLow = false;
-    bool sosLow = (digitalRead(BTN_EMERGENCY) == LOW);
-    bool guardPassed = (millis() - loopStartTime > BTN_GUARD_MS);
-
-    if (sosLow && !sosWasLow) {
-      Serial.print(F("[BTN] SOS pressed (GPIO14) guard="));
-      Serial.print(guardPassed ? F("OK") : F("WAIT"));
-      Serial.print(F(" t=")); Serial.println(millis());
-    }
-    sosWasLow = sosLow;
-
-    if (guardPassed && sosLow && millis() - lastButtonPress > DEBOUNCE_MS) {
+  // ── ปุ่ม EMERGENCY ────────────────────────────────────────
+  if (digitalRead(BTN_EMERGENCY) == LOW) {
+    if (millis() - lastButtonPress > DEBOUNCE_MS) {
       lastButtonPress = millis();
       if (!emergencyActive) {
         triggerEmergency("MANUAL SOS");
       } else {
+        // กดซ้ำ = toggle buzzer
         buzzerToggle = !buzzerToggle;
-        if (!buzzerToggle) { silenceBuzzer(); digitalWrite(LED_RED, LOW); }
-        Serial.println(buzzerToggle ? F("Buzzer ON") : F("Buzzer OFF"));
+        if (!buzzerToggle) { noTone(BUZZER); digitalWrite(LED_RED, LOW); }
+        Serial.println(buzzerToggle ? F("🚨 Buzzer ON") : F("🔇 Buzzer OFF"));
       }
     }
   }
@@ -546,19 +339,16 @@ void loop() {
 // ============================================================
 void sampleForML() {
   sensors_event_t a, g, temp;
-  getMPUEvent(&a, &g, &temp);
+  mpu.getEvent(&a, &g, &temp);
 
   ml_ax[ml_idx] = a.acceleration.x;
   ml_ay[ml_idx] = a.acceleration.y;
   ml_az[ml_idx] = a.acceleration.z;
   ml_idx = (ml_idx + 1) % ML_WIN;
   ml_samples_new++;
-  ml_total_samples++;
 
   // Run inference every ML_STEP new samples (= every 1 s)
-  // Guard: wait until buffer is fully filled (ML_WIN samples) to avoid
-  // false positives from zero-padded startup window
-  if (ml_samples_new >= ML_STEP && ml_total_samples >= ML_WIN) {
+  if (ml_samples_new >= ML_STEP) {
     ml_samples_new = 0;
     // Build a contiguous window from the circular buffer
     float wx[ML_WIN], wy[ML_WIN], wz[ML_WIN];
@@ -569,9 +359,10 @@ void sampleForML() {
     extract_features_ml(wx, wy, wz, ML_WIN, ml_features, ML_FS);
     int pred = mlPredict(ml_features);
     ml_fall_flag = (pred == 1);
-    // ML does NOT trigger emergency independently — it only confirms in FALL_VERIFY
-    // (direct ML trigger caused too many false positives on normal movement)
-    if (ml_fall_flag) Serial.println(F("[ML] FALL flag set (waiting for threshold confirm)"));
+    if (ml_fall_flag && !emergencyActive) {
+      Serial.println(F("[ML] FALL predicted → triggering emergency"));
+      triggerEmergency("ML FALL");
+    }
   }
 }
 
@@ -682,9 +473,9 @@ void extract_features_ml(float* ax, float* ay, float* az,
 // ============================================================
 int mlPredict(float* features) {
   switch (currentMode) {
-    case CHEST: return chestModel.predict(features);
-    case SHIRT: return shirtModel.predict(features);
-    case PANTS: return pantsModel.predict(features);
+    case CHEST: return FallDetectorChest::predict(features);
+    case SHIRT: return FallDetectorShirt::predict(features);
+    case PANTS: return FallDetectorPants::predict(features);
     default:    return 0;
   }
 }
@@ -694,7 +485,7 @@ int mlPredict(float* features) {
 // ============================================================
 void processMPU() {
   sensors_event_t a, g, temp;
-  getMPUEvent(&a, &g, &temp);
+  mpu.getEvent(&a, &g, &temp);
 
   float ax = a.acceleration.x;
   float ay = a.acceleration.y;
@@ -703,85 +494,48 @@ void processMPU() {
 
   switch (fallState) {
 
-    case FALL_IDLE: {
-      // Debug: print acc_mag ทุก 1 วิ เพื่อ tune threshold
-      static unsigned long lastMagPrint = 0;
-      if (millis() - lastMagPrint >= 1000) {
-        lastMagPrint = millis();
-        Serial.print(F("[MPU] mag=")); Serial.print(acc_mag, 2);
-        Serial.print(F(" ax=")); Serial.print(ax, 1);
-        Serial.print(F(" ay=")); Serial.print(ay, 1);
-        Serial.print(F(" az=")); Serial.println(az, 1);
-      }
+    case FALL_IDLE:
       if (acc_mag < FREEFALL_THRESHOLD) {
         fallState     = FALL_FREEFALL;
         freefallStart = millis();
-        Serial.print(F("[!] Freefall start mag=")); Serial.println(acc_mag, 2);
+        Serial.println(F("⚠️  Freefall detected"));
       }
       break;
-    }
 
     case FALL_FREEFALL:
       if (acc_mag > IMPACT_THRESHOLD) {
-        unsigned long ffDuration = millis() - freefallStart;
-        if (ffDuration >= FREEFALL_MIN_MS) {
-          // freefall นานพอ → impact จริง
-          fallState  = FALL_VERIFY;   // ข้าม FALL_IMPACT (ไม่มีประโยชน์)
-          impactTime = millis();
-          if (Blynk.connected()) Blynk.virtualWrite(V0, 1);  // WARNING
-          Serial.print(F("[!] Impact! freefall="));
-          Serial.print(ffDuration);
-          Serial.println(F("ms -> verifying 3s..."));
-        } else {
-          // freefall สั้นเกิน → vibration/tap — กรองออก
-          Serial.print(F("[!] Brief freefall filtered ("));
-          Serial.print(ffDuration);
-          Serial.println(F("ms < 120ms)"));
-          fallState = FALL_IDLE;
-        }
+        fallState  = FALL_IMPACT;
+        impactTime = millis();
+        Blynk.virtualWrite(V0, 1);  // WARNING
+        Serial.println(F("💥 Impact detected → starting verification"));
       } else if (millis() - freefallStart > 2000) {
-        fallState = FALL_IDLE;  // freefall นานเกิน 2s → false positive
+        fallState = FALL_IDLE;  // freefall นานเกิน → false positive
       }
       break;
 
     case FALL_IMPACT:
-      fallState = FALL_VERIFY;  // legacy path (ไม่ควรเข้ามาแล้ว)
+      fallState = FALL_VERIFY;
       break;
 
     case FALL_VERIFY:
       if (millis() - impactTime >= VERIFY_WINDOW) {
-        // ตรวจว่าคนยังนิ่ง (ไม่ลุก): acc_mag อยู่ในช่วงแรงโน้มถ่วงปกติ
-        // ไม่ดูแค่ az เพื่อรองรับทุก orientation (ล้มข้าง/หลัง/หน้า)
-        bool stillOnGround = (acc_mag >= STILL_MAG_MIN && acc_mag <= STILL_MAG_MAX);
-        bool mlFall        = ml_fall_flag;
-
-        Serial.print(F("[VERIFY] acc_mag="));   Serial.print(acc_mag, 2);
-        Serial.print(F(" still="));             Serial.print(stillOnGround);
-        Serial.print(F(" ML="));               Serial.println(mlFall);
-
-        if (stillOnGround && mlFall) {
-          // ทั้ง threshold และ ML ยืนยัน → FALL แน่นอน
-          Serial.println(F("FALL CONFIRMED (threshold+ML)"));
+        // az ต่ำ + magnitude ~1g = นอนอยู่ยังไม่ลุก
+        bool thresholdFall = (abs(az) < LYING_THRESHOLD && acc_mag < 12.0f);
+        // ML ยืนยันจาก window ล่าสุด (ลด false positive)
+        bool mlFall = ml_fall_flag;
+        if (thresholdFall || mlFall) {
+          Serial.print(F("FALL CONFIRMED — threshold:"));
+          Serial.print(thresholdFall); Serial.print(F(" ML:"));
+          Serial.println(mlFall);
           fallState = FALL_EMERGENCY;
-          triggerEmergency("FALL CONFIRMED");
-        } else if (mlFall) {
-          // ML เดียวยืนยัน → trigger (ML ถูก train มาสำหรับกรณีนี้)
-          Serial.println(F("FALL CONFIRMED (ML only)"));
-          fallState = FALL_EMERGENCY;
-          triggerEmergency("ML FALL");
-        } else if (stillOnGround) {
-          // threshold เดียว ไม่มี ML → Near Fall warning เท่านั้น
-          Serial.println(F("Near Fall — threshold only, no ML confirm"));
-          tone(BUZZER, 2800, 400); silenceBuzzer();
-          if (Blynk.connected()) Blynk.virtualWrite(V0, 1);
-          fallState    = FALL_IDLE;
-          ml_fall_flag = false;
+          triggerEmergency(mlFall ? "ML+THRESH FALL" : "THRESH FALL");
         } else {
-          // ลุกขึ้นได้ทัน → recovered
-          Serial.println(F("Recovered — no fall"));
-          fallState    = FALL_IDLE;
+          // ลุกขึ้นได้ = Near Fall เท่านั้น
+          Serial.println(F("Near Fall — person recovered"));
+          tone(BUZZER, 1500, 400);
+          Blynk.virtualWrite(V0, 1);   // WARNING brief
+          fallState = FALL_IDLE;
           ml_fall_flag = false;
-          if (Blynk.connected()) Blynk.virtualWrite(V0, 0);
         }
       }
       break;
@@ -802,24 +556,21 @@ void triggerEmergency(const char* reason) {
   buzzer5sActive  = true;
   buzzer5sStart   = millis();
   emergencyStart  = millis();
-  lastOLEDTimer   = 0;      // reset OLED timer so it updates immediately
   ml_fall_flag    = false;  // reset so ML doesn't re-fire
 
-  Serial.println(F("\n[!] ================================"));
+  Serial.println(F("\n🔴 ══════════════════════════════"));
   Serial.print(F("   EMERGENCY: ")); Serial.println(reason);
   Serial.print(F("   Mode: ")); printMode(currentMode); Serial.println();
   Serial.print(F("   GPS : ")); Serial.print(gpsLat, 6);
   Serial.print(F(", "));        Serial.println(gpsLon, 6);
-  Serial.println(F("[!] ================================\n"));
+  Serial.println(F("🔴 ══════════════════════════════\n"));
 
   // ส่ง Blynk
-  if (Blynk.connected()) {
-    Blynk.virtualWrite(V0, 2);
-    Blynk.virtualWrite(V1, gpsLat);
-    Blynk.virtualWrite(V2, gpsLon);
-    Blynk.virtualWrite(V3, (int)currentMode);
-    Blynk.virtualWrite(V4, 1);
-  }
+  Blynk.virtualWrite(V0, 2);               // FALL
+  Blynk.virtualWrite(V1, gpsLat);
+  Blynk.virtualWrite(V2, gpsLon);
+  Blynk.virtualWrite(V3, (int)currentMode);
+  Blynk.virtualWrite(V4, 1);              // Emergency active
 
   // LED ทุกดวงติด
   digitalWrite(LED_GREEN,  HIGH);
@@ -827,43 +578,6 @@ void triggerEmergency(const char* reason) {
   digitalWrite(LED_RED,    HIGH);
 
   displayFall(reason);
-}
-
-// ============================================================
-//  CLEAR EMERGENCY  (กด BTN_MODE ขณะ emergency active)
-// ============================================================
-void clearEmergency() {
-  emergencyActive = false;
-  modeLocked      = false;
-  buzzerToggle    = false;
-  buzzer5sActive  = false;
-  fallState       = FALL_IDLE;
-  ml_fall_flag    = false;
-  silenceBuzzer();
-  allLEDOff();
-  if (Blynk.connected()) {
-    Blynk.virtualWrite(V0, 0);
-    Blynk.virtualWrite(V4, 0);
-  }
-  setLED(currentMode);
-  displayMode(currentMode);
-  Serial.println(F("[OK] Emergency cleared by BTN_MODE"));
-}
-
-// ============================================================
-//  BUZZER SILENCE HELPER
-//  noTone() บน ESP32 อาจไม่คืน pin ให้ GPIO matrix → ต้อง pinMode อีกครั้ง
-// ============================================================
-void silenceBuzzer() {
-  noTone(BUZZER);
-  // ESP-IDF gpio_reset_pin: ตัด LEDC / ทุก peripheral ออกจาก pin ทันที
-  // แล้ว re-configure เป็น GPIO output LOW
-  gpio_reset_pin((gpio_num_t)BUZZER);
-  gpio_set_direction((gpio_num_t)BUZZER, GPIO_MODE_OUTPUT);
-  gpio_set_level((gpio_num_t)BUZZER, 0);
-  // Sync Arduino layer ด้วย
-  pinMode(BUZZER, OUTPUT);
-  digitalWrite(BUZZER, LOW);
 }
 
 // ============================================================
@@ -913,7 +627,6 @@ void allLEDOff() {
 //  OLED DISPLAY
 // ============================================================
 void showBoot(const __FlashStringHelper* msg) {
-  if (!oledOK) return;  // skip if OLED not connected
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
