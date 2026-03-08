@@ -44,6 +44,7 @@
 
 #include <Wire.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include "driver/gpio.h"   // ESP-IDF native GPIO API (ใช้ใน silenceBuzzer)
 #include <BlynkSimpleEsp32.h>
 #include <Adafruit_GFX.h>
@@ -52,7 +53,7 @@
 #include <Adafruit_Sensor.h>
 #include <TinyGPS.h>
 #include <EEPROM.h>
-#include <arduinoFFT.h>      // ArduinoFFT by Enrique Condes
+// ArduinoFFT removed — new 22-feature model doesn't use FFT
 
 // ML model headers — สร้างจาก ML/ESP32_export.ipynb แล้ว copy มาไว้ใน sketch folder
 #include "CHEST_model.h"
@@ -104,12 +105,21 @@ float   mpuAccelScale = 4096.0f; // LSB/g — set in setup() by reading ACCEL_CO
 // Raw MPU6050 read — works for 0x70 clones without Adafruit library
 // Scale is auto-detected from ACCEL_CONFIG readback in setup()
 // ±500°/s gyro (65.5 LSB/°/s)
+// Last-good accelerometer reading (safe fallback if I2C times out)
+static float mpuLastAx = 0.0f, mpuLastAy = 0.0f, mpuLastAz = 9.80665f;
+
 void mpuGetRaw(sensors_event_t *a, sensors_event_t *g, sensors_event_t *t) {
   Wire.beginTransmission(mpuI2CAddr);
   Wire.write(0x3B);  // ACCEL_XOUT_H
   Wire.endTransmission(true);
   Wire.requestFrom(mpuI2CAddr, (uint8_t)14);
-  if (Wire.available() < 14) return;
+  if (Wire.available() < 14) {
+    // I2C timeout — keep last good reading to avoid false fall/garbage
+    a->acceleration.x = mpuLastAx;
+    a->acceleration.y = mpuLastAy;
+    a->acceleration.z = mpuLastAz;
+    return;
+  }
   int16_t rax = (Wire.read()<<8)|Wire.read();
   int16_t ray = (Wire.read()<<8)|Wire.read();
   int16_t raz = (Wire.read()<<8)|Wire.read();
@@ -124,6 +134,10 @@ void mpuGetRaw(sensors_event_t *a, sensors_event_t *g, sensors_event_t *t) {
   g->gyro.y = rgy * (M_PI / (180.0f * 65.5f));
   g->gyro.z = rgz * (M_PI / (180.0f * 65.5f));
   t->temperature = rt / 340.0f + 36.53f;
+  // Update last-good cache
+  mpuLastAx = a->acceleration.x;
+  mpuLastAy = a->acceleration.y;
+  mpuLastAz = a->acceleration.z;
 }
 
 // Drop-in replacement for mpu.getEvent()
@@ -164,17 +178,16 @@ const unsigned long FREEFALL_MIN_MS = 120; // freefall ต้องนานอ�
 const unsigned long VERIFY_WINDOW   = 3000; // ms — รอยืนยัน 3 วิหลัง impact
 
 // ===== ML BUFFER (50 Hz sliding window) =====
-#define ML_WIN   100     // 100 samples = 2 s @ 50 Hz  (CHEST/SHIRT)
-#define ML_WIN_P  80     // 80 samples = 2 s @ 40 Hz   (PANTS proxy)
-#define ML_STEP   50     // run inference every 50 new samples
-#define ML_FS     50     // sampling rate for ML feature extraction
+#define ML_WIN    50     // 50 samples = 1s @ 50Hz (window ตรงกับ real-data model)
+#define ML_STEP   25     // run inference ทุก 0.5s (overlap 50%)
+#define ML_FS     50     // sampling rate
 
 static float ml_ax[ML_WIN], ml_ay[ML_WIN], ml_az[ML_WIN];
-static int   ml_idx            = 0;   // circular buffer write position
-static int   ml_samples_new    = 0;   // samples collected since last inference
-static int   ml_total_samples  = 0;   // total ever collected (guard for startup)
-static float ml_features[26];         // output of extract_features_ml()
-static bool  ml_fall_flag      = false; // set true when ML predicts FALL
+static int   ml_idx            = 0;
+static int   ml_samples_new    = 0;
+static int   ml_total_samples  = 0;
+static float ml_features[22];         // 22 features (real-data model)
+static bool  ml_fall_flag      = false;
 
 // ===== FLAGS =====
 bool modeLocked      = false;
@@ -189,7 +202,8 @@ unsigned long lastMPURead      = 0;
 unsigned long lastMLSample     = 0;   // NEW: 50 Hz ML sampling
 unsigned long lastGPSUpdate    = 0;
 unsigned long lastBlynkSync    = 0;
-unsigned long lastButtonPress  = 0;
+unsigned long lastModePress     = 0;
+unsigned long lastSOSPress      = 0;
 unsigned long buzzer5sStart    = 0;
 unsigned long emergencyStart   = 0;
 unsigned long lastOLEDTimer    = 0;   // OLED emergency timer (global to reset properly)
@@ -218,10 +232,12 @@ void setup() {
   pinMode(LED_YELLOW,    OUTPUT);
   pinMode(LED_RED,       OUTPUT);
   pinMode(BUZZER,        OUTPUT);
+  // Max GPIO drive strength = 40mA (vs default 20mA) → louder buzzer
+  gpio_set_drive_capability((gpio_num_t)BUZZER, GPIO_DRIVE_CAP_3);
   pinMode(BTN_MODE,      INPUT_PULLUP);
   pinMode(BTN_EMERGENCY, INPUT_PULLUP);
   allLEDOff();
-  digitalWrite(BUZZER, LOW);
+  digitalWrite(BUZZER, HIGH);  // active-LOW buzzer: HIGH = silent
   Serial.println(F("[OK] GPIO configured"));
 
   // ── DIAGNOSTIC: print button states immediately after pinMode ──────
@@ -255,6 +271,7 @@ void setup() {
   delay(50);
   Wire.begin(OLED_SDA, OLED_SCL);
   Wire.setClock(10000);
+  Wire.setTimeOut(30);  // 30ms timeout — prevents I2C bus hang (clone may clock-stretch)
   delay(50);
 
   // WHO_AM_I check — try 0x68 (AD0=GND) then 0x69 (AD0=VCC/float)
@@ -392,10 +409,10 @@ void setup() {
   setLED(currentMode);
   displayMode(currentMode);
 
-  // Welcome beep
-  tone(BUZZER, 3000, 80); delay(110);
-  tone(BUZZER, 4000, 80); delay(110);
-  silenceBuzzer();  // Force pin กลับมาอยู่ใต้ GPIO control หลัง LEDC
+  // Startup ready beep (2 beeps)
+  tone(BUZZER, BUZZER_FREQ, 120); delay(180); silenceBuzzer();
+  delay(100);
+  tone(BUZZER, BUZZER_FREQ, 120); delay(180); silenceBuzzer();
 
   Serial.println(F("\n=== SYSTEM READY — MONITORING ==="));
 }
@@ -450,7 +467,7 @@ void loop() {
     if (millis() - buzzer5sStart < 5000) {
       if (millis() - lastBeep > 300) {
         lastBeep = millis();
-        tone(BUZZER, 3800, 150);
+        tone(BUZZER, BUZZER_FREQ, 150);
       }
     } else {
       buzzer5sActive = false;
@@ -465,7 +482,7 @@ void loop() {
     if (millis() - lastBuzz > 200) {
       lastBuzz = millis();
       buzzState = !buzzState;
-      if (buzzState) { tone(BUZZER, 4000, 150); digitalWrite(LED_RED, HIGH); }
+      if (buzzState) { tone(BUZZER, BUZZER_FREQ, 150); digitalWrite(LED_RED, HIGH); }
       else           { silenceBuzzer(); digitalWrite(LED_RED, LOW); }
     }
   }
@@ -478,22 +495,21 @@ void loop() {
     }
   }
 
-  // ── ปุ่ม MODE ─────────────────────────────────────────────
-  // ขณะ emergency: กด BTN_MODE เพื่อ clear emergency
-  // ขณะปกติ: กด BTN_MODE เพื่อเปลี่ยน mode
-  // ── ปุ่ม MODE (GPIO 3) ────────────────────────────────────
+  // ── ปุ่ม MODE (GPIO 10) ───────────────────────────────────
+  // trigger บน falling edge เท่านั้น (HIGH→LOW) — ไม่ fire ซ้ำขณะกดค้าง
   {
     static bool modeWasLow = false;
-    bool modeLow = (digitalRead(BTN_MODE) == LOW);
-    if (modeLow && !modeWasLow) {
-      // falling edge — แสดง raw state ทันที (ก่อน debounce)
-      Serial.print(F("[BTN] MODE pressed (GPIO3) t="));
-      Serial.println(millis());
-    }
+    bool modeLow        = (digitalRead(BTN_MODE) == LOW);
+    bool modeFallingEdge = modeLow && !modeWasLow;
     modeWasLow = modeLow;
 
-    if (modeLow && millis() - lastButtonPress > DEBOUNCE_MS) {
-      lastButtonPress = millis();
+    if (modeFallingEdge) {
+      Serial.print(F("[BTN] MODE edge (GPIO10) t="));
+      Serial.println(millis());
+    }
+
+    if (modeFallingEdge && millis() - lastModePress > DEBOUNCE_MS) {
+      lastModePress = millis();
       if (emergencyActive) {
         Serial.println(F("[BTN] MODE -> clear emergency"));
         clearEmergency();
@@ -514,26 +530,27 @@ void loop() {
   }
 
   // ── ปุ่ม EMERGENCY (GPIO 14) ─────────────────────────────
+  // trigger บน falling edge เท่านั้น (HIGH→LOW) — ไม่ fire ซ้ำขณะกดค้าง
   {
     static bool sosWasLow = false;
-    bool sosLow = (digitalRead(BTN_EMERGENCY) == LOW);
-    bool guardPassed = (millis() - loopStartTime > BTN_GUARD_MS);
+    bool sosLow         = (digitalRead(BTN_EMERGENCY) == LOW);
+    bool sosFallingEdge  = sosLow && !sosWasLow;
+    bool guardPassed    = (millis() - loopStartTime > BTN_GUARD_MS);
+    sosWasLow = sosLow;
 
-    if (sosLow && !sosWasLow) {
-      Serial.print(F("[BTN] SOS pressed (GPIO14) guard="));
+    if (sosFallingEdge) {
+      Serial.print(F("[BTN] SOS edge (GPIO14) guard="));
       Serial.print(guardPassed ? F("OK") : F("WAIT"));
       Serial.print(F(" t=")); Serial.println(millis());
     }
-    sosWasLow = sosLow;
 
-    if (guardPassed && sosLow && millis() - lastButtonPress > DEBOUNCE_MS) {
-      lastButtonPress = millis();
+    if (sosFallingEdge && guardPassed && millis() - lastSOSPress > DEBOUNCE_MS) {
+      lastSOSPress = millis();
       if (!emergencyActive) {
         triggerEmergency("MANUAL SOS");
       } else {
-        buzzerToggle = !buzzerToggle;
-        if (!buzzerToggle) { silenceBuzzer(); digitalWrite(LED_RED, LOW); }
-        Serial.println(buzzerToggle ? F("Buzzer ON") : F("Buzzer OFF"));
+        Serial.println(F("[BTN] SOS -> clear emergency"));
+        clearEmergency();
       }
     }
   }
@@ -566,119 +583,113 @@ void sampleForML() {
       int j = (ml_idx + i) % ML_WIN;
       wx[i] = ml_ax[j]; wy[i] = ml_ay[j]; wz[i] = ml_az[j];
     }
-    extract_features_ml(wx, wy, wz, ML_WIN, ml_features, ML_FS);
+    extract_features_ml(wx, wy, wz, ML_WIN, ml_features);
     int pred = mlPredict(ml_features);
-    ml_fall_flag = (pred == 1);
-    // ML does NOT trigger emergency independently — it only confirms in FALL_VERIFY
-    // (direct ML trigger caused too many false positives on normal movement)
-    if (ml_fall_flag) Serial.println(F("[ML] FALL flag set (waiting for threshold confirm)"));
+    // pred: 0=NORMAL  1=FALLING  2=FALLEN
+    // FALLING (pred==1) F1 ต่ำ (0.45) → false positive เยอะ
+    // ใช้เฉพาะ FALLEN (pred==2) เพื่อความแม่นยำ
+    ml_fall_flag = (pred == 2);
+    if (pred > 0) {
+      Serial.print(F("[ML] pred="));
+      Serial.println(pred == 1 ? "FALLING" : "FALLEN");
+    }
   }
 }
 
 // ============================================================
-//  ML — FEATURE EXTRACTION (23 features, matches Python)
+//  ML — FEATURE EXTRACTION (22 features, matches RealData_Model.ipynb)
+//  feat[0..2]  = ax/ay/az mean
+//  feat[3..5]  = ax/ay/az std
+//  feat[6..10] = mag mean/std/max/min/iqr
+//  feat[11..13]= jerk mean/max/std
+//  feat[14]    = energy, feat[15] = peak2peak
+//  feat[16..17]= corr_xz / corr_yz
+//  feat[18]    = mag skewness
+//  feat[19]    = frac samples >19.6 m/s2 (>2g impact)
+//  feat[20]    = frac samples <4.9  m/s2 (<0.5g freefall)
+//  feat[21]    = jerk energy
 // ============================================================
-void extract_features_ml(float* ax, float* ay, float* az,
-                          int n, float* out, float fs) {
-  // ── Statistics ─────────────────────────────────────────────
-  float sum_ax = 0, sum_ay = 0, sum_az = 0;
+void extract_features_ml(float* ax, float* ay, float* az, int n, float* out) {
   float mag[ML_WIN];
-  for (int i = 0; i < n; i++) {
-    mag[i] = sqrt(ax[i]*ax[i] + ay[i]*ay[i] + az[i]*az[i]);
-    sum_ax += ax[i]; sum_ay += ay[i]; sum_az += az[i];
+  float sum_ax=0, sum_ay=0, sum_az=0, sum_mag=0;
+  for (int i=0;i<n;i++){
+    mag[i]=sqrtf(ax[i]*ax[i]+ay[i]*ay[i]+az[i]*az[i]);
+    sum_ax+=ax[i]; sum_ay+=ay[i]; sum_az+=az[i]; sum_mag+=mag[i];
   }
-  float mean_ax = sum_ax/n, mean_ay = sum_ay/n, mean_az = sum_az/n;
-  float mag_sum = 0;
-  for (int i = 0; i < n; i++) mag_sum += mag[i];
-  float mag_mean = mag_sum / n;
+  float mean_ax=sum_ax/n, mean_ay=sum_ay/n, mean_az=sum_az/n;
+  float mag_mean=sum_mag/n;
 
-  float var_ax = 0, var_ay = 0, var_az = 0, var_mag = 0;
-  for (int i = 0; i < n; i++) {
-    var_ax  += (ax[i]-mean_ax)*(ax[i]-mean_ax);
-    var_ay  += (ay[i]-mean_ay)*(ay[i]-mean_ay);
-    var_az  += (az[i]-mean_az)*(az[i]-mean_az);
-    var_mag += (mag[i]-mag_mean)*(mag[i]-mag_mean);
+  float var_ax=0,var_ay=0,var_az=0,var_mag=0;
+  float min_mag=mag[0],max_mag=mag[0];
+  int   cnt_high=0, cnt_low=0;
+  for (int i=0;i<n;i++){
+    var_ax +=(ax[i]-mean_ax)*(ax[i]-mean_ax);
+    var_ay +=(ay[i]-mean_ay)*(ay[i]-mean_ay);
+    var_az +=(az[i]-mean_az)*(az[i]-mean_az);
+    var_mag+=(mag[i]-mag_mean)*(mag[i]-mag_mean);
+    if(mag[i]<min_mag)min_mag=mag[i];
+    if(mag[i]>max_mag)max_mag=mag[i];
+    if(mag[i]>19.6f)cnt_high++;
+    if(mag[i]<4.9f) cnt_low++;
   }
-  float std_ax = sqrt(var_ax/n), std_ay = sqrt(var_ay/n), std_az = sqrt(var_az/n);
-  float std_mag = sqrt(var_mag/n) + 1e-9f;
+  float std_ax =sqrtf(var_ax/n),  std_ay =sqrtf(var_ay/n),  std_az =sqrtf(var_az/n);
+  float std_mag=sqrtf(var_mag/n)+1e-9f;
 
-  float min_mag = mag[0], max_mag = mag[0];
-  for (int i = 1; i < n; i++) {
-    if (mag[i] < min_mag) min_mag = mag[i];
-    if (mag[i] > max_mag) max_mag = mag[i];
+  // IQR of mag (sort-free approximation via mean±std)
+  float q75=mag_mean+0.675f*std_mag, q25=mag_mean-0.675f*std_mag;
+  float mag_iqr=q75-q25;
+
+  // Skewness
+  float skew=0;
+  for(int i=0;i<n;i++){float d=(mag[i]-mag_mean)/std_mag; skew+=d*d*d;}
+  skew/=n;
+
+  // Jerk
+  float jerk_sum=0,jerk_max=0,jerk_sq=0;
+  float var_jerk=0; float jerk_vals[ML_WIN-1];
+  for(int i=1;i<n;i++){
+    float dx=ax[i]-ax[i-1], dy=ay[i]-ay[i-1], dz=az[i]-az[i-1];
+    float jm=sqrtf(dx*dx+dy*dy+dz*dz);
+    jerk_vals[i-1]=jm;
+    jerk_sum+=jm; if(jm>jerk_max)jerk_max=jm; jerk_sq+=jm*jm;
   }
+  int nj=n-1;
+  float jerk_mean=jerk_sum/nj;
+  float jerk_e=jerk_sq/nj;
+  float var_j=0; for(int i=0;i<nj;i++) var_j+=(jerk_vals[i]-jerk_mean)*(jerk_vals[i]-jerk_mean);
+  float jerk_std=sqrtf(var_j/nj);
 
-  float rms_ax = 0, rms_ay = 0, rms_az = 0;
-  for (int i = 0; i < n; i++) {
-    rms_ax += ax[i]*ax[i]; rms_ay += ay[i]*ay[i]; rms_az += az[i]*az[i];
+  // Energy
+  float energy=0;
+  for(int i=0;i<n;i++) energy+=ax[i]*ax[i]+ay[i]*ay[i]+az[i]*az[i];
+  energy/=n;
+
+  // Correlations xz and yz
+  float cxz=0,cyz=0;
+  for(int i=0;i<n;i++){
+    cxz+=(ax[i]-mean_ax)*(az[i]-mean_az);
+    cyz+=(ay[i]-mean_ay)*(az[i]-mean_az);
   }
-  rms_ax = sqrt(rms_ax/n); rms_ay = sqrt(rms_ay/n); rms_az = sqrt(rms_az/n);
+  float dxz=std_ax*std_az*n+1e-9f;
+  float dyz=std_ay*std_az*n+1e-9f;
 
-  // ── Skewness + Kurtosis ─────────────────────────────────────
-  float skew = 0, kurt = 0;
-  for (int i = 0; i < n; i++) {
-    float d = (mag[i] - mag_mean) / std_mag;
-    skew += d*d*d; kurt += d*d*d*d;
-  }
-  skew /= n;
-  kurt  = kurt/n - 3.0f;  // excess kurtosis
-
-  // ── Zero-crossing ───────────────────────────────────────────
-  int zc = 0;
-  for (int i = 1; i < n; i++) {
-    if ((mag[i]-mag_mean) * (mag[i-1]-mag_mean) < 0) zc++;
-  }
-
-  // ── SMA ─────────────────────────────────────────────────────
-  float sma = 0;
-  for (int i = 0; i < n; i++) sma += fabs(ax[i]) + fabs(ay[i]) + fabs(az[i]);
-  sma /= n;
-
-  // ── FFT — dominant freq + spectral energy ──────────────────
-  static double vReal[ML_WIN], vImag[ML_WIN];
-  for (int i = 0; i < n; i++) { vReal[i] = mag[i]; vImag[i] = 0.0; }
-  ArduinoFFT<double> FFT(vReal, vImag, n, fs);
-  FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
-  FFT.compute(FFT_FORWARD);
-  FFT.complexToMagnitude();
-  float dom_freq  = (float)FFT.majorPeak();
-  float spec_e = 0;
-  for (int i = 0; i < n/2; i++) spec_e += (float)(vReal[i]*vReal[i]);
-
-  // ── Max Jerk ────────────────────────────────────────────────
-  float max_jerk = 0;
-  for (int i = 1; i < n; i++) {
-    float j = fabs(mag[i] - mag[i-1]) * fs;
-    if (j > max_jerk) max_jerk = j;
-  }
-
-  // ── Pearson Correlations ─────────────────────────────────────
-  float cxy = 0, cyz = 0, cxz = 0;
-  for (int i = 0; i < n; i++) {
-    cxy += (ax[i]-mean_ax)*(ay[i]-mean_ay);
-    cyz += (ay[i]-mean_ay)*(az[i]-mean_az);
-    cxz += (ax[i]-mean_ax)*(az[i]-mean_az);
-  }
-  float dxy = std_ax * std_ay * n + 1e-9f;
-  float dyz = std_ay * std_az * n + 1e-9f;
-  float dxz = std_ax * std_az * n + 1e-9f;
-
-  // ── Pack 23 features ─────────────────────────────────────────
-  int k = 0;
-  out[k++] = mean_ax; out[k++] = mean_ay; out[k++] = mean_az;
-  out[k++] = std_ax;  out[k++] = std_ay;  out[k++] = std_az;
-  out[k++] = min_mag; out[k++] = max_mag; out[k++] = max_mag - min_mag;
-  out[k++] = rms_ax;  out[k++] = rms_ay;  out[k++] = rms_az;
-  out[k++] = skew;    out[k++] = kurt;
-  out[k++] = (float)zc; out[k++] = sma;
-  out[k++] = dom_freq;  out[k++] = spec_e;
-  out[k++] = cxy/dxy;   out[k++] = cyz/dyz;   out[k++] = cxz/dxz;
-  out[k++] = max_jerk;
-  out[k++] = var_mag/n;   // acc_variance  (k now = 23)
+  // Pack 22 features
+  int k=0;
+  out[k++]=mean_ax; out[k++]=mean_ay; out[k++]=mean_az;
+  out[k++]=std_ax;  out[k++]=std_ay;  out[k++]=std_az;
+  out[k++]=mag_mean; out[k++]=std_mag; out[k++]=max_mag; out[k++]=min_mag; out[k++]=mag_iqr;
+  out[k++]=jerk_mean; out[k++]=jerk_max; out[k++]=jerk_std;
+  out[k++]=energy;
+  out[k++]=max_mag-min_mag;
+  out[k++]=cxz/dxz; out[k++]=cyz/dyz;
+  out[k++]=skew;
+  out[k++]=(float)cnt_high/n;
+  out[k++]=(float)cnt_low/n;
+  out[k++]=jerk_e;  // k=22
 }
 
 // ============================================================
-//  ML — PREDICT (mode-aware, returns 0=ADL 1=FALL)
+//  ML — PREDICT (mode-aware, returns 0=NORMAL 1=FALLING 2=FALLEN)
 // ============================================================
 int mlPredict(float* features) {
   switch (currentMode) {
@@ -772,7 +783,7 @@ void processMPU() {
         } else if (stillOnGround) {
           // threshold เดียว ไม่มี ML → Near Fall warning เท่านั้น
           Serial.println(F("Near Fall — threshold only, no ML confirm"));
-          tone(BUZZER, 2800, 400); silenceBuzzer();
+          tone(BUZZER, BUZZER_FREQ, 400); silenceBuzzer();
           if (Blynk.connected()) Blynk.virtualWrite(V0, 1);
           fallState    = FALL_IDLE;
           ml_fall_flag = false;
@@ -789,6 +800,25 @@ void processMPU() {
     case FALL_EMERGENCY:
       break;  // รอ acknowledge
   }
+}
+
+// ============================================================
+//  NOTIFY CAREGIVER — HTTP GET โดยตรง (ไม่ต้องใช้ Blynk Automation)
+//  เรียกครั้งเดียวตอน emergency เกิด/หาย
+// ============================================================
+void notifyCaregiverHTTP(int val) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "https://blynk.cloud/external/api/update?token=";
+  url += CAREGIVER_TOKEN;
+  url += "&V4=";
+  url += val;
+  http.begin(url);
+  http.setTimeout(3000);
+  int code = http.GET();
+  http.end();
+  Serial.print(F("[HTTP] Caregiver V4=")); Serial.print(val);
+  Serial.print(F(" -> ")); Serial.println(code);
 }
 
 // ============================================================
@@ -812,7 +842,7 @@ void triggerEmergency(const char* reason) {
   Serial.print(F(", "));        Serial.println(gpsLon, 6);
   Serial.println(F("[!] ================================\n"));
 
-  // ส่ง Blynk
+  // ส่ง Blynk (User device)
   if (Blynk.connected()) {
     Blynk.virtualWrite(V0, 2);
     Blynk.virtualWrite(V1, gpsLat);
@@ -820,6 +850,8 @@ void triggerEmergency(const char* reason) {
     Blynk.virtualWrite(V3, (int)currentMode);
     Blynk.virtualWrite(V4, 1);
   }
+  // ส่งตรงไปหา Caregiver device ผ่าน HTTP (ไม่ต้องใช้ Blynk Automation)
+  notifyCaregiverHTTP(1);
 
   // LED ทุกดวงติด
   digitalWrite(LED_GREEN,  HIGH);
@@ -845,6 +877,7 @@ void clearEmergency() {
     Blynk.virtualWrite(V0, 0);
     Blynk.virtualWrite(V4, 0);
   }
+  notifyCaregiverHTTP(0);  // แจ้ง Caregiver ว่า emergency หายแล้ว
   setLED(currentMode);
   displayMode(currentMode);
   Serial.println(F("[OK] Emergency cleared by BTN_MODE"));
@@ -856,14 +889,14 @@ void clearEmergency() {
 // ============================================================
 void silenceBuzzer() {
   noTone(BUZZER);
-  // ESP-IDF gpio_reset_pin: ตัด LEDC / ทุก peripheral ออกจาก pin ทันที
-  // แล้ว re-configure เป็น GPIO output LOW
+  // gpio_reset_pin releases LEDC — re-configure pin as output LOW
   gpio_reset_pin((gpio_num_t)BUZZER);
   gpio_set_direction((gpio_num_t)BUZZER, GPIO_MODE_OUTPUT);
-  gpio_set_level((gpio_num_t)BUZZER, 0);
-  // Sync Arduino layer ด้วย
+  gpio_set_level((gpio_num_t)BUZZER, 1);  // HIGH = silent for active-LOW buzzer
   pinMode(BUZZER, OUTPUT);
-  digitalWrite(BUZZER, LOW);
+  digitalWrite(BUZZER, HIGH);  // active-LOW: HIGH = silent
+  // Restore 40mA drive (gpio_reset_pin resets it back to default 20mA)
+  gpio_set_drive_capability((gpio_num_t)BUZZER, GPIO_DRIVE_CAP_3);
 }
 
 // ============================================================

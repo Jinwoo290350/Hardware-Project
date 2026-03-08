@@ -13,8 +13,8 @@
 #define BLYNK_AUTH_TOKEN    "zKh2MMHzfkT4l2fXpKjc_TcjgLIT23LS"
 
 // ── WiFi ─────────────────────────────────────────────────────
-#define WIFI_SSID  "KUWIN-IOT"
-#define WIFI_PASS  ""           // open network — ไม่มีรหัสผ่าน
+#define WIFI_SSID  "Frank"
+#define WIFI_PASS  "frank285"           // open network — ไม่มีรหัสผ่าน
 
 // ── MQTT (สำรอง — ไม่ได้ใช้ใน Blynk mode) ────────────────────
 // #define MQTT_BROKER "iot.cpe.ku.ac.th"

@@ -83,7 +83,7 @@ export function FallDetectionProvider({
   userCode: string
 }) {
   const [status,          setStatus]          = useState<SystemStatus>("NORMAL")
-  const [activity,        setActivity]        = useState<MotionActivity>("Sitting")
+  const [activity,        setActivity]        = useState<MotionActivity>("Walking")
   const [emergencyActive, setEmergencyActive] = useState(false)
   const [caregiverActive, setCaregiverActive] = useState(false)
   const [emergencyTimer,  setEmergencyTimer]  = useState(0)
@@ -94,7 +94,7 @@ export function FallDetectionProvider({
   const [history,         setHistory]         = useState<HistoryEvent[]>([])
 
   const timerRef           = useRef<ReturnType<typeof setInterval> | null>(null)
-  const prevStatusRef      = useRef<number>(0)
+  const prevStatusRef      = useRef<number>(-1)
   const emergencyActiveRef = useRef(false)
 
   // ── Load user history from localStorage on mount ──────────

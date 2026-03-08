@@ -21,10 +21,18 @@
 // (ต้องอยู่ใน config.h เพื่อให้ compiler เห็น enum ก่อน auto-generated prototypes)
 enum Mode { CHEST = 0, SHIRT = 1, PANTS = 2 };
 
+// ── Buzzer resonant frequency ────────────────────────────────
+// ปรับค่านี้เพื่อหาความถี่ที่ buzzer ดังที่สุด (ทดสอบจาก startup sweep)
+// buzzer ราคาถูกส่วนใหญ่อยู่ที่ 2400-3000Hz
+#define BUZZER_FREQ  2730
+
 // ── Debug: ปิด fall detection อัตโนมัติ (ใช้เฉพาะทดสอบ) ────────────
 // Uncomment บรรทัดด้านล่างเพื่อปิด threshold + ML fall detection
 // (BTN_EMERGENCY ยังทำงานได้ปกติ)
-// #define DISABLE_AUTO_FALL
+// #define DISABLE_AUTO_FALL   // ← เปิด fall detection แล้ว
+
+// ── Caregiver device token (ใช้ส่ง HTTP โดยตรงแทน Blynk Automation) ────
+#define CAREGIVER_TOKEN "zKh2MMHzfkT4l2fXpKjc_TcjgLIT23LS"
 
 // ── MQTT (สำรอง — ไม่ได้ใช้ใน Blynk mode) ────────────────────
 // #define MQTT_BROKER "iot.cpe.ku.ac.th"
