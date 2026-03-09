@@ -11,10 +11,13 @@ import {
 } from "react"
 import {
   fetchBlynkState,
+  writeBlynkPin,
   MODE_NAMES,
   type DeviceMode,
   POLL_INTERVAL,
   BLYNK_TOKEN,
+  PIN_STATUS,
+  PIN_EMERGENCY,
 } from "@/lib/blynk-config"
 import {
   saveUserHistory,
@@ -152,7 +155,7 @@ export function FallDetectionProvider({
         return
       }
 
-      setConnected(true)
+      setConnected(data.deviceOnline)
       setDeviceMode(MODE_NAMES[data.mode] ?? "CHEST")
       setGpsLat(data.lat)
       setGpsLon(data.lon)
@@ -203,10 +206,14 @@ export function FallDetectionProvider({
 
   // ── Acknowledge ───────────────────────────────────────────
   const acknowledgeFall = useCallback(() => {
+    // ล้างค่าใน Blynk cloud เพื่อป้องกัน poll รอบต่อไปยิง SOS ซ้ำ
+    writeBlynkPin(PIN_EMERGENCY, 0)
+    writeBlynkPin(PIN_STATUS,    0)
     stopEmergencyTimer()
     emergencyActiveRef.current = false
     setEmergencyActive(false)
     setCaregiverActive(true)
+    // prevStatusRef ยังคงเป็น 2 ไว้ก่อน — poll จะ reset เป็น 0 เองเมื่อ Blynk ส่ง 0 กลับมา
   }, [stopEmergencyTimer])
 
   // ── Resolve ───────────────────────────────────────────────
@@ -214,7 +221,7 @@ export function FallDetectionProvider({
     setCaregiverActive(false)
     setStatus("NORMAL")
     setActivity("Sitting")
-    prevStatusRef.current = 0
+    // ไม่ reset prevStatusRef ที่นี่ — ปล่อยให้ poll loop จัดการเองเมื่อ Blynk ส่งค่า 0
     setHistory(prev =>
       prev.map(e =>
         e.status === "pending" ? { ...e, status: "resolved" as EventStatus } : e

@@ -210,6 +210,7 @@ bool modeLocked      = false;
 bool emergencyActive = false;
 bool buzzerToggle    = false;
 bool buzzer5sActive  = false;
+bool resetJerkPrev   = false;  // set true เมื่อเปลี่ยนโหมด → processMPU() reset static prev
 
 // ===== TIMING =====
 unsigned long freefallStart    = 0;
@@ -223,6 +224,9 @@ unsigned long lastSOSPress      = 0;
 unsigned long buzzer5sStart    = 0;
 unsigned long emergencyStart   = 0;
 unsigned long lastOLEDTimer    = 0;   // OLED emergency timer (global to reset properly)
+unsigned long lastOLEDStatus   = 0;   // OLED live status update during monitoring
+float lastMag  = 9.8f;                // ค่าล่าสุดสำหรับ OLED display
+float lastJerk = 0.0f;
 
 const unsigned long DEBOUNCE_MS    = 300;
 const unsigned long BTN_GUARD_MS   = 2000; // ignore BTN_EMERGENCY for 2s after loop() starts
@@ -506,6 +510,14 @@ void loop() {
     }
   }
 
+  // ── OLED live status (MONITOR, ไม่ emergency) ───────────────
+  if (sysState == SYS_MONITOR && !emergencyActive) {
+    if (millis() - lastOLEDStatus >= 2000) {
+      lastOLEDStatus = millis();
+      displayLiveStatus(lastMag, lastJerk);
+    }
+  }
+
   // ── ปุ่ม MODE (GPIO10) — falling edge only ───────────────
   {
     static bool modeWasLow = false;
@@ -514,23 +526,21 @@ void loop() {
     modeWasLow = modeLow;
     if (modeFall && millis() - lastModePress > DEBOUNCE_MS) {
       lastModePress = millis();
-      if (sysState == SYS_SETUP) {
-        // SETUP: เลือกโหมดถัดไป
+      if (emergencyActive) {
+        // ขณะ emergency: clear
+        Serial.println(F("[BTN] MODE -> clear emergency"));
+        clearEmergency();
+      } else {
+        // ทั้ง SETUP และ MONITOR: BTN10 = เปลี่ยนโหมดเสมอ
         currentMode = (Mode)((currentMode + 1) % 3);
         saveMode(currentMode);
+        if (Blynk.connected()) Blynk.virtualWrite(V3, (int)currentMode);
+        resetFallState();  // reset jerk/fall state เพื่อป้องกัน false trigger จากการย้ายตำแหน่ง
         tone(BUZZER, 3200, 80); delay(100); silenceBuzzer();
         setLED(currentMode);
-        displaySetup(currentMode);
-        Serial.print(F("[SETUP] Mode: ")); printMode(currentMode); Serial.println();
-      } else {
-        // MONITOR: ปุ่มไหนก็ SOS / clear
-        if (emergencyActive) {
-          Serial.println(F("[BTN] MODE -> clear emergency"));
-          clearEmergency();
-        } else {
-          Serial.println(F("[BTN] MODE -> SOS"));
-          triggerEmergency("MANUAL SOS");
-        }
+        if (sysState == SYS_SETUP) displaySetup(currentMode);
+        else                        displayMode(currentMode);
+        Serial.print(F("[MODE] ")); printMode(currentMode); Serial.println();
       }
     }
   }
@@ -736,9 +746,11 @@ void processMPU() {
 
   // ── Jerk: ความเร็วการเปลี่ยนแปลง (|Δacc| ระหว่าง 2 sample ห่างกัน 200ms) ──
   static float prev_ax = 0, prev_ay = 0, prev_az = 9.8f;
+  if (resetJerkPrev) { prev_ax = ax; prev_ay = ay; prev_az = az; resetJerkPrev = false; }
   float dax = ax - prev_ax, day = ay - prev_ay, daz = az - prev_az;
   float jerk = sqrtf(dax*dax + day*day + daz*daz);
   prev_ax = ax; prev_ay = ay; prev_az = az;
+  lastMag = acc_mag; lastJerk = jerk;  // update global for OLED
 
   switch (fallState) {
 
@@ -899,6 +911,17 @@ void triggerEmergency(const char* reason) {
 }
 
 // ============================================================
+//  RESET FALL STATE — เรียกเมื่อเปลี่ยนโหมด เพื่อป้องกัน jerk false-trigger
+// ============================================================
+void resetFallState() {
+  fallState    = FALL_IDLE;
+  ml_fall_flag = false;
+  lastMag      = 9.8f;
+  lastJerk     = 0.0f;
+  resetJerkPrev = true;  // processMPU() จะ reset static prev บน next call
+}
+
+// ============================================================
 //  CLEAR EMERGENCY  (กด BTN_MODE ขณะ emergency active)
 // ============================================================
 void clearEmergency() {
@@ -1031,6 +1054,54 @@ void displayMode(Mode mode) {
   display.setTextSize(1);
   display.setCursor(0, 48);
   display.println(F("MONITORING ACTIVE"));
+  display.display();
+}
+
+// แสดงสถานะ live ระหว่าง MONITOR — อัปเดตทุก 2 วิ
+// แสดง: mode / fallState / mag / jerk (บรรทัดล่าง)
+void displayLiveStatus(float mag, float jerk) {
+  if (!oledOK) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // บรรทัด 0: mode
+  display.setCursor(0, 0);
+  switch (currentMode) {
+    case CHEST: display.print(F("CHEST CLIP"));   break;
+    case SHIRT: display.print(F("SHIRT POCKET")); break;
+    case PANTS: display.print(F("PANTS POCKET")); break;
+  }
+
+  // บรรทัด 1: สถานะ fall state machine
+  display.setCursor(0, 12);
+  switch (fallState) {
+    case FALL_IDLE:      display.print(F("[ NORMAL ]"));    break;
+    case FALL_FREEFALL:  display.print(F("[ FREEFALL ]"));  break;
+    case FALL_VERIFY:    display.print(F("[ VERIFYING ]")); break;
+    case FALL_EMERGENCY: display.print(F("[ FALL !! ]"));   break;
+    default:             display.print(F("[ ... ]"));       break;
+  }
+
+  // divider
+  display.drawLine(0, 23, 127, 23, SSD1306_WHITE);
+
+  // บรรทัด 2: mag
+  display.setCursor(0, 27);
+  display.print(F("mag  "));
+  display.print(mag, 2);
+  display.print(F(" m/s2"));
+
+  // บรรทัด 3: jerk
+  display.setCursor(0, 39);
+  display.print(F("jerk "));
+  display.print(jerk, 2);
+  display.print(F(" m/s2"));
+
+  // บรรทัด 4: hint
+  display.setCursor(0, 55);
+  display.print(F("13=SOS  10=mode"));
+
   display.display();
 }
 

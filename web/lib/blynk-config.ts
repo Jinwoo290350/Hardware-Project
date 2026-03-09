@@ -20,22 +20,29 @@ export const MODE_NAMES: Record<number, DeviceMode> = {
   2: "PANTS",
 }
 
-// ดึงข้อมูลจาก Blynk ทุก pin ในครั้งเดียว
+// ดึงข้อมูลจาก Blynk ทุก pin พร้อมเช็ค device online
+// ถ้า device offline → emergency=0 เสมอ (ป้องกันค่าเก่าจาก Blynk cloud)
 export async function fetchBlynkState(): Promise<{
   status: number
   lat: number
   lon: number
   mode: number
   emergency: number
+  deviceOnline: boolean
 } | null> {
   if (!BLYNK_TOKEN || BLYNK_TOKEN === "YOUR_USER_DEVICE_AUTH_TOKEN") return null
 
   try {
-    const url = `${BLYNK_BASE_URL}/get?token=${BLYNK_TOKEN}&${PIN_STATUS}&${PIN_LAT}&${PIN_LON}&${PIN_MODE}&${PIN_EMERGENCY}`
-    const res = await fetch(url, { cache: "no-store" })
-    if (!res.ok) return null
+    // fetch online status + pin values แบบ parallel
+    const [onlineRes, pinRes] = await Promise.all([
+      fetch(`${BLYNK_BASE_URL}/isHardwareConnected?token=${BLYNK_TOKEN}`, { cache: "no-store" }),
+      fetch(`${BLYNK_BASE_URL}/get?token=${BLYNK_TOKEN}&${PIN_STATUS}&${PIN_LAT}&${PIN_LON}&${PIN_MODE}&${PIN_EMERGENCY}`, { cache: "no-store" }),
+    ])
 
-    const data = await res.json()
+    if (!pinRes.ok) return null
+
+    const online = onlineRes.ok && (await onlineRes.text()).trim() === "true"
+    const data   = await pinRes.json()
 
     // Blynk API returns { "V0": ["0"], "V1": ["13.79"], ... }
     const parse = (key: string, fallback = 0) => {
@@ -45,13 +52,22 @@ export async function fetchBlynkState(): Promise<{
     }
 
     return {
-      status:    parse(PIN_STATUS),
-      lat:       parse(PIN_LAT),
-      lon:       parse(PIN_LON),
-      mode:      parse(PIN_MODE),
-      emergency: parse(PIN_EMERGENCY),
+      status:       online ? parse(PIN_STATUS)    : 0,
+      lat:          parse(PIN_LAT),
+      lon:          parse(PIN_LON),
+      mode:         parse(PIN_MODE),
+      emergency:    online ? parse(PIN_EMERGENCY) : 0,  // offline → ไม่ยิง SOS
+      deviceOnline: online,
     }
   } catch {
     return null
   }
+}
+
+// เขียนค่าลง Blynk pin — ใช้ล้าง V4=0, V0=0 เมื่อ acknowledge
+export async function writeBlynkPin(pin: string, value: number): Promise<void> {
+  if (!BLYNK_TOKEN) return
+  try {
+    await fetch(`${BLYNK_BASE_URL}/update?token=${BLYNK_TOKEN}&${pin}=${value}`, { cache: "no-store" })
+  } catch { /* ignore */ }
 }
