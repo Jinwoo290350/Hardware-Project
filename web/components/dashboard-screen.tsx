@@ -13,6 +13,7 @@ import {
   WifiOff,
 } from "lucide-react"
 import { MotionAnimation } from "@/components/motion-animation"
+import { MapCard }          from "@/components/map-card"
 
 /* ── Hero ── */
 function MotionHero() {
@@ -182,10 +183,8 @@ export function DashboardScreen() {
   return (
     <div className="flex flex-col gap-4 pb-4">
       <MotionHero />
-      <div className="grid grid-cols-2 gap-3">
-        <LocationCard />
-        <DeviceModeCard />
-      </div>
+      <MapCard />
+      <DeviceModeCard />
       <ConnectionStrip />
       <StatusBar />
     </div>

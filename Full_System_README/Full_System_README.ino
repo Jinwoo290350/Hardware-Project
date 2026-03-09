@@ -11,7 +11,7 @@
  *   GPS Module (UART RX=16, read-only)
  *   LED Green=4  Yellow=5  Red=6
  *   Buzzer GPIO 7
- *   BTN_MODE=10  BTN_EMERGENCY=14
+ *   BTN_MODE=10  BTN_EMERGENCY=13
  *
  * Libraries (Arduino Library Manager):
  *   - Blynk  by Volodymyr Shymanskyy
@@ -75,8 +75,9 @@ FallDetectorPants pantsModel;
 #define LED_YELLOW     5    // LED เหลือง
 #define LED_RED        6    // LED แดง
 
-#define BTN_MODE       10   // ปุ่มสลับ mode (GPIO10 — ย้ายจาก GPIO3 ซึ่งเป็น UART0_RX)
-#define BTN_EMERGENCY  14   // ปุ่ม SOS (GPIO14 — ย้ายจาก GPIO46 ซึ่งเป็น strapping/pull-down)
+#define BTN_MODE       10   // ปุ่มสลับ mode (short) / clear emergency
+#define BTN_EMERGENCY  13   // ปุ่ม SOS / cancel SOS
+#define LONG_PRESS_MS  1500 // กดค้าง BTN_MODE >= 1.5s ขณะปกติ = SOS (fallback)
 
 #define BUZZER         7    // Buzzer
 
@@ -149,7 +150,8 @@ void getMPUEvent(sensors_event_t *a, sensors_event_t *g, sensors_event_t *t) {
 // ===== GPS =====
 TinyGPS gps;
 HardwareSerial GPSSerial(2);
-float gpsLat = 0.0f, gpsLon = 0.0f;
+// Default = คณะวิศวกรรมศาสตร์ มหาวิทยาลัยเกษตรศาสตร์ (ใช้เมื่อ GPS หาสัญญาณไม่เจอ)
+float gpsLat = 13.8474f, gpsLon = 100.5693f;
 
 // ===== EEPROM =====
 #define EEPROM_SIZE      1
@@ -170,12 +172,22 @@ enum FallState {
 FallState fallState = FALL_IDLE;
 
 // Fall detection thresholds (หน่วย m/s²)
-const float FREEFALL_THRESHOLD  = 3.0f;   // ต่ำกว่านี้ = กำลังตกอิสระ  (0.3g)
-const float IMPACT_THRESHOLD    = 14.7f;  // สูงกว่านี้ = กระแทกพื้น (1.5g) — ±2g sensor max ~19.6
-const float STILL_MAG_MIN       = 6.5f;   // หลังล้ม: acc_mag ≥ นี้ = ยังมีแรงโน้มถ่วง (ไม่ใช่ตก)
-const float STILL_MAG_MAX       = 13.0f;  // หลังล้ม: acc_mag ≤ นี้ = ยังนิ่ง ไม่ลุก
-const unsigned long FREEFALL_MIN_MS = 120; // freefall ต้องนานอย่างน้อย 120ms (กรอง vibration)
-const unsigned long VERIFY_WINDOW   = 3000; // ms — รอยืนยัน 3 วิหลัง impact
+// ── ปรับค่าเหล่านี้จากผล notebook analysis ──
+const float FREEFALL_THRESHOLD  = 3.0f;   // < นี้ = freefall  (tune: min fall mag - margin)
+const float IMPACT_THRESHOLD    = 14.7f;  // > นี้ = impact    (tune: p75 ของ fall impact)
+const float STILL_MAG_MIN       = 6.5f;   // post-fall: ยังมีแรงโน้มถ่วง
+const float STILL_MAG_MAX       = 13.0f;  // post-fall: ยังนิ่งอยู่กับพื้น
+
+// ── Jerk (ความเร็วการเปลี่ยนแปลง) ──────────────────────────
+// jerk = |Δacc_vec| ระหว่างสอง sample ที่ห่างกัน 200ms (5Hz)
+// การพลิกตัวฉับพลัน/สะดุด: jerk สูงมาก แม้ไม่มี freefall ชัดเจน
+const float JERK_THRESHOLD      = 22.0f;  // m/s² ต่อ sample — tune จากข้อมูล
+//   walk/run jerk ≈ 3-12  m/s²  → ต้องต่ำกว่า JERK_THRESHOLD
+//   fall jerk   ≈ 20-60+ m/s²  → ต้องสูงกว่า JERK_THRESHOLD
+// วิธี tune: Serial monitor → "[MPU] jerk=" ขณะเดิน/วิ่ง/ล้ม
+
+const unsigned long FREEFALL_MIN_MS = 120;
+const unsigned long VERIFY_WINDOW   = 3000;
 
 // ===== ML BUFFER (50 Hz sliding window) =====
 #define ML_WIN    50     // 50 samples = 1s @ 50Hz (window ตรงกับ real-data model)
@@ -244,7 +256,7 @@ void setup() {
   delay(50);  // let internal pull-ups settle
   Serial.print(F("[DIAG] BTN_MODE  (GPIO10) = "));
   Serial.println(digitalRead(BTN_MODE)      == HIGH ? F("HIGH (ok)") : F("LOW !! check wiring/short"));
-  Serial.print(F("[DIAG] BTN_EMERG (GPIO14) = "));
+  Serial.print(F("[DIAG] BTN_EMERG (GPIO13) = "));
   Serial.println(digitalRead(BTN_EMERGENCY) == HIGH ? F("HIGH (ok)") : F("LOW !! check wiring/short"));
 
   // EEPROM — โหลด mode ที่บันทึกไว้
@@ -341,14 +353,13 @@ void setup() {
   Serial.println(F("[OK] MPU6050 initialized (range: +-8g)"));
 
   // Self-calibrating scale: sample raw mag during 10s still period
-  // (ไม่พึ่ง ACCEL_CONFIG register เพราะ clone บางตัวโกหก)
   Serial.println(F("[..] Calibrating MPU6050 (10s) - keep STILL..."));
   showBoot(F("CALIBRATING\n  10 sec\n  keep still"));
   {
     float rawMagSum = 0; int rawMagCount = 0;
     for (int i = 0; i < 200; i++) {
       Wire.beginTransmission(mpuI2CAddr);
-      Wire.write(0x3B);  // ACCEL_XOUT_H
+      Wire.write(0x3B);
       Wire.endTransmission(true);
       Wire.requestFrom(mpuI2CAddr, (uint8_t)6);
       if (Wire.available() >= 6) {
@@ -358,13 +369,10 @@ void setup() {
         rawMagSum += sqrt((float)rx*rx + (float)ry*ry + (float)rz*rz);
         rawMagCount++;
       }
-      delay(50);  // 200 × 50ms = 10s total
+      delay(50);
     }
     if (rawMagCount > 10) {
-      float measured = rawMagSum / rawMagCount;
-      // measured raw units correspond to 1g; 9.80665 m/s² = 1g
-      // store LSB/g so mpuGetRaw() divides raw/mpuAccelScale*9.80665 correctly
-      mpuAccelScale = measured;
+      mpuAccelScale = rawMagSum / rawMagCount;
       Serial.print(F("[OK] Scale auto-calibrated: "));
       Serial.print(mpuAccelScale, 1);
       Serial.println(F(" LSB/g (raw counts per g)"));
@@ -427,13 +435,10 @@ void loop() {
   if (Blynk.connected()) Blynk.run();
 
 #ifndef DISABLE_AUTO_FALL
-  // ── ML buffer fill @ 50Hz (ทำงานเสมอ รวมถึงระหว่าง emergency ด้วย) ──
   if (millis() - lastMLSample >= ML_INTERVAL) {
     lastMLSample = millis();
     sampleForML();
   }
-
-  // ── Fall detection @ 5Hz (ไม่ทำงานขณะ emergency) ──────────
   if (!emergencyActive && millis() - lastMPURead >= MPU_INTERVAL) {
     lastMPURead = millis();
     processMPU();
@@ -495,58 +500,40 @@ void loop() {
     }
   }
 
-  // ── ปุ่ม MODE (GPIO 10) ───────────────────────────────────
-  // trigger บน falling edge เท่านั้น (HIGH→LOW) — ไม่ fire ซ้ำขณะกดค้าง
+  // ── ปุ่ม MODE (GPIO10) — falling edge only ───────────────
   {
     static bool modeWasLow = false;
-    bool modeLow        = (digitalRead(BTN_MODE) == LOW);
-    bool modeFallingEdge = modeLow && !modeWasLow;
+    bool modeLow = (digitalRead(BTN_MODE) == LOW);
+    bool modeFall = modeLow && !modeWasLow;
     modeWasLow = modeLow;
-
-    if (modeFallingEdge) {
-      Serial.print(F("[BTN] MODE edge (GPIO10) t="));
-      Serial.println(millis());
-    }
-
-    if (modeFallingEdge && millis() - lastModePress > DEBOUNCE_MS) {
+    if (modeFall && millis() - lastModePress > DEBOUNCE_MS) {
       lastModePress = millis();
       if (emergencyActive) {
         Serial.println(F("[BTN] MODE -> clear emergency"));
         clearEmergency();
-        return;
+      } else if (!modeLocked) {
+        currentMode = (Mode)((currentMode + 1) % 3);
+        saveMode(currentMode);
+        if (Blynk.connected()) Blynk.virtualWrite(V3, (int)currentMode);
+        tone(BUZZER, 3200, 80); delay(100); silenceBuzzer();
+        setLED(currentMode);
+        displayMode(currentMode);
+        Serial.print(F("> Mode: ")); printMode(currentMode); Serial.println();
       }
-      if (modeLocked) {
-        Serial.println(F("[BTN] MODE ignored (modeLocked)"));
-        return;
-      }
-      currentMode = (Mode)((currentMode + 1) % 3);
-      saveMode(currentMode);
-      if (Blynk.connected()) Blynk.virtualWrite(V3, (int)currentMode);
-      tone(BUZZER, 3200, 80); delay(100); silenceBuzzer();
-      setLED(currentMode);
-      displayMode(currentMode);
-      Serial.print(F("> Mode: ")); printMode(currentMode); Serial.println();
     }
   }
 
-  // ── ปุ่ม EMERGENCY (GPIO 14) ─────────────────────────────
-  // trigger บน falling edge เท่านั้น (HIGH→LOW) — ไม่ fire ซ้ำขณะกดค้าง
+  // ── ปุ่ม EMERGENCY (GPIO13) — falling edge only ──────────
   {
     static bool sosWasLow = false;
-    bool sosLow         = (digitalRead(BTN_EMERGENCY) == LOW);
-    bool sosFallingEdge  = sosLow && !sosWasLow;
-    bool guardPassed    = (millis() - loopStartTime > BTN_GUARD_MS);
+    bool sosLow  = (digitalRead(BTN_EMERGENCY) == LOW);
+    bool sosFall = sosLow && !sosWasLow;
+    bool guard   = (millis() - loopStartTime > BTN_GUARD_MS);
     sosWasLow = sosLow;
-
-    if (sosFallingEdge) {
-      Serial.print(F("[BTN] SOS edge (GPIO14) guard="));
-      Serial.print(guardPassed ? F("OK") : F("WAIT"));
-      Serial.print(F(" t=")); Serial.println(millis());
-    }
-
-    if (sosFallingEdge && guardPassed && millis() - lastSOSPress > DEBOUNCE_MS) {
+    if (sosFall && guard && millis() - lastSOSPress > DEBOUNCE_MS) {
       lastSOSPress = millis();
       if (!emergencyActive) {
+        Serial.println(F("[BTN] SOS -> trigger"));
         triggerEmergency("MANUAL SOS");
       } else {
         Serial.println(F("[BTN] SOS -> clear emergency"));
@@ -710,24 +697,39 @@ void processMPU() {
   float ax = a.acceleration.x;
   float ay = a.acceleration.y;
   float az = a.acceleration.z;
-  float acc_mag = sqrt(ax*ax + ay*ay + az*az);
+  float acc_mag = sqrtf(ax*ax + ay*ay + az*az);
+
+  // ── Jerk: ความเร็วการเปลี่ยนแปลง (|Δacc| ระหว่าง 2 sample ห่างกัน 200ms) ──
+  static float prev_ax = 0, prev_ay = 0, prev_az = 9.8f;
+  float dax = ax - prev_ax, day = ay - prev_ay, daz = az - prev_az;
+  float jerk = sqrtf(dax*dax + day*day + daz*daz);
+  prev_ax = ax; prev_ay = ay; prev_az = az;
 
   switch (fallState) {
 
     case FALL_IDLE: {
-      // Debug: print acc_mag ทุก 1 วิ เพื่อ tune threshold
-      static unsigned long lastMagPrint = 0;
-      if (millis() - lastMagPrint >= 1000) {
-        lastMagPrint = millis();
+      // Debug: print ทุก 1 วิ
+      static unsigned long lastPrint = 0;
+      if (millis() - lastPrint >= 1000) {
+        lastPrint = millis();
         Serial.print(F("[MPU] mag=")); Serial.print(acc_mag, 2);
-        Serial.print(F(" ax=")); Serial.print(ax, 1);
-        Serial.print(F(" ay=")); Serial.print(ay, 1);
-        Serial.print(F(" az=")); Serial.println(az, 1);
+        Serial.print(F(" jerk="));    Serial.println(jerk, 2);
       }
+
+      // Path A: freefall (ตกอิสระ → ช้าๆ)
       if (acc_mag < FREEFALL_THRESHOLD) {
         fallState     = FALL_FREEFALL;
         freefallStart = millis();
-        Serial.print(F("[!] Freefall start mag=")); Serial.println(acc_mag, 2);
+        Serial.print(F("[!] Freefall mag=")); Serial.println(acc_mag, 2);
+      }
+      // Path B: jerk สูงมาก = พลิกตัวฉับพลัน/สะดุด โดยไม่มี freefall ชัด
+      // ต้องมีทั้ง jerk สูง + acc_mag สูงพอ (ไม่ใช่แค่ noise)
+      else if (jerk > JERK_THRESHOLD && acc_mag > IMPACT_THRESHOLD * 0.7f) {
+        fallState  = FALL_VERIFY;
+        impactTime = millis();
+        if (Blynk.connected()) Blynk.virtualWrite(V0, 1);
+        Serial.print(F("[!] High-jerk fall! jerk=")); Serial.print(jerk, 1);
+        Serial.print(F(" mag=")); Serial.println(acc_mag, 1);
       }
       break;
     }
