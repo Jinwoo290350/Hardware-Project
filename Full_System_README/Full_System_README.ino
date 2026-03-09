@@ -171,6 +171,10 @@ enum FallState {
 };
 FallState fallState = FALL_IDLE;
 
+// ===== SYSTEM STATE (SETUP → MONITOR) =====
+enum SysState { SYS_SETUP, SYS_MONITOR };
+SysState sysState = SYS_MONITOR;  // เริ่ม monitor ทันที
+
 // Fall detection thresholds (หน่วย m/s²)
 // ── ปรับค่าเหล่านี้จากผล notebook analysis ──
 const float FREEFALL_THRESHOLD  = 3.0f;   // < นี้ = freefall  (tune: min fall mag - margin)
@@ -435,13 +439,15 @@ void loop() {
   if (Blynk.connected()) Blynk.run();
 
 #ifndef DISABLE_AUTO_FALL
-  if (millis() - lastMLSample >= ML_INTERVAL) {
-    lastMLSample = millis();
-    sampleForML();
-  }
-  if (!emergencyActive && millis() - lastMPURead >= MPU_INTERVAL) {
-    lastMPURead = millis();
-    processMPU();
+  if (sysState == SYS_MONITOR) {
+    if (millis() - lastMLSample >= ML_INTERVAL) {
+      lastMLSample = millis();
+      sampleForML();
+    }
+    if (!emergencyActive && millis() - lastMPURead >= MPU_INTERVAL) {
+      lastMPURead = millis();
+      processMPU();
+    }
   }
 #endif  // DISABLE_AUTO_FALL
 
@@ -508,17 +514,23 @@ void loop() {
     modeWasLow = modeLow;
     if (modeFall && millis() - lastModePress > DEBOUNCE_MS) {
       lastModePress = millis();
-      if (emergencyActive) {
-        Serial.println(F("[BTN] MODE -> clear emergency"));
-        clearEmergency();
-      } else if (!modeLocked) {
+      if (sysState == SYS_SETUP) {
+        // SETUP: เลือกโหมดถัดไป
         currentMode = (Mode)((currentMode + 1) % 3);
         saveMode(currentMode);
-        if (Blynk.connected()) Blynk.virtualWrite(V3, (int)currentMode);
         tone(BUZZER, 3200, 80); delay(100); silenceBuzzer();
         setLED(currentMode);
-        displayMode(currentMode);
-        Serial.print(F("> Mode: ")); printMode(currentMode); Serial.println();
+        displaySetup(currentMode);
+        Serial.print(F("[SETUP] Mode: ")); printMode(currentMode); Serial.println();
+      } else {
+        // MONITOR: ปุ่มไหนก็ SOS / clear
+        if (emergencyActive) {
+          Serial.println(F("[BTN] MODE -> clear emergency"));
+          clearEmergency();
+        } else {
+          Serial.println(F("[BTN] MODE -> SOS"));
+          triggerEmergency("MANUAL SOS");
+        }
       }
     }
   }
@@ -532,12 +544,26 @@ void loop() {
     sosWasLow = sosLow;
     if (sosFall && guard && millis() - lastSOSPress > DEBOUNCE_MS) {
       lastSOSPress = millis();
-      if (!emergencyActive) {
-        Serial.println(F("[BTN] SOS -> trigger"));
-        triggerEmergency("MANUAL SOS");
+      if (sysState == SYS_SETUP) {
+        // SETUP: confirm โหมด → เข้า MONITOR
+        sysState = SYS_MONITOR;
+        if (Blynk.connected()) Blynk.virtualWrite(V3, (int)currentMode);
+        // beep สองครั้ง = เริ่ม monitor
+        tone(BUZZER, 2200, 180); delay(250); silenceBuzzer();
+        delay(80);
+        tone(BUZZER, 2800, 180); delay(250); silenceBuzzer();
+        setLED(currentMode);
+        displayMode(currentMode);
+        Serial.print(F("[START] Monitoring — mode: ")); printMode(currentMode); Serial.println();
       } else {
-        Serial.println(F("[BTN] SOS -> clear emergency"));
-        clearEmergency();
+        // MONITOR: SOS / clear
+        if (emergencyActive) {
+          Serial.println(F("[BTN] SOS -> clear emergency"));
+          clearEmergency();
+        } else {
+          Serial.println(F("[BTN] SOS -> trigger"));
+          triggerEmergency("MANUAL SOS");
+        }
       }
     }
   }
@@ -573,12 +599,21 @@ void sampleForML() {
     extract_features_ml(wx, wy, wz, ML_WIN, ml_features);
     int pred = mlPredict(ml_features);
     // pred: 0=NORMAL  1=FALLING  2=FALLEN
-    // FALLING (pred==1) F1 ต่ำ (0.45) → false positive เยอะ
-    // ใช้เฉพาะ FALLEN (pred==2) เพื่อความแม่นยำ
-    ml_fall_flag = (pred == 2);
+    // FALLING (pred==1) F1 ต่ำ → false positive เยอะ → ไม่ใช้
+    // FALLEN (pred==2) ต้องเจอ 2 รอบติดกัน ถึงยิง (consecutive filter)
+    static int ml_fallen_count = 0;
+    if (pred == 2) {
+      ml_fallen_count++;
+      ml_fall_flag = (ml_fallen_count >= 2);
+    } else {
+      ml_fallen_count = 0;
+      ml_fall_flag = false;
+    }
     if (pred > 0) {
       Serial.print(F("[ML] pred="));
-      Serial.println(pred == 1 ? "FALLING" : "FALLEN");
+      Serial.print(pred == 1 ? F("FALLING") : F("FALLEN"));
+      if (pred == 2) { Serial.print(F(" x")); Serial.print(ml_fallen_count); }
+      Serial.println();
     }
   }
 }
@@ -960,7 +995,30 @@ void showBoot(const __FlashStringHelper* msg) {
   display.display();
 }
 
+// แสดง SETUP screen — กด 10 เลือก, กด 13 confirm
+void displaySetup(Mode mode) {
+  if (!oledOK) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("-- SELECT MODE --"));
+  display.setTextSize(2);
+  display.setCursor(0, 14);
+  switch (mode) {
+    case CHEST: display.println(F("CHEST\nCLIP"));   break;
+    case SHIRT: display.println(F("SHIRT\nPOCKET")); break;
+    case PANTS: display.println(F("PANTS\nPOCKET")); break;
+  }
+  display.setTextSize(1);
+  display.setCursor(0, 52);
+  display.println(F("BTN10=next  BTN13=ok"));
+  display.display();
+}
+
+// แสดง MONITOR screen — ระบบกำลัง detect อยู่
 void displayMode(Mode mode) {
+  if (!oledOK) return;
   display.clearDisplay();
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
