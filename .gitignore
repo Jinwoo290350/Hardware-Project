@@ -41,6 +41,9 @@ Full_System_README/PANTS_model.h
 .vscode/settings.json
 .vscode/launch.json
 
+# ── Local History (VS Code extension) ─────────
+.history/
+
 # ── Logs ─────────────────────────────────────
 *.log
 npm-debug.log*
